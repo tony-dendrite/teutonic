@@ -406,8 +406,9 @@ def _cleanup_model_cache():
         for _mtime, d, size in sorted(candidates):
             if running < target_bytes:
                 break
-            # Digest snapshots are named by digest; keep the loaded king.
-            if _king_digest and d.name == _king_digest:
+            # Digest snapshots are named by digest with `:` → `-` (see
+            # model_store._cache_snapshot_path); keep the loaded king.
+            if _king_digest and d.name == _king_digest.replace(":", "-"):
                 continue
             shutil.rmtree(d, ignore_errors=True)
             running -= size

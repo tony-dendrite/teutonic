@@ -9,7 +9,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import math
 import os
 import signal
 import sys
@@ -38,10 +37,8 @@ import chain_config  # noqa: E402
 from model_store import (  # noqa: E402
     DIGEST_RE,
     ModelRef,
-    ensure_ref_exists,
     list_snapshot_files,
     materialize_model,
-    parse_reveal_payload,
     parse_reveal_v3,
     snapshot_size,
 )
@@ -68,21 +65,8 @@ NETUID = int(os.environ.get("TEUTONIC_NETUID", "3"))
 # write is 100% to BURN_UID (default 0 = subnet-owner burn slot). The eval +
 # duel + dashboard pipeline keeps running for observability so the operator
 # always has a canonical king artifact ready, but no chain emission flows to
-# any miner. To turn emission on (future operator decision), set
-# TEUTONIC_EMIT_TO_KING=1 explicitly — defaults to off.
+# any miner.
 BURN_UID = int(os.environ.get("TEUTONIC_BURN_UID", "0"))
-EMIT_TO_KING = os.environ.get("TEUTONIC_EMIT_TO_KING", "0") == "1"
-
-# Adaptive δ — §6.4. δ_t = DELTA_C * king_loss_ema, with king_loss_ema an EMA
-# (~10-duel half-life via EMA_ALPHA=0.1) over eval-server avg_king_loss. The
-# bar is a constant fraction of the king's current loss, not a constant in
-# nats — so it doesn't become unwinnable at maturity or trivial at cold start.
-DELTA_C = float(os.environ.get("TEUTONIC_DELTA_C", "0.001"))
-EMA_ALPHA = float(os.environ.get("TEUTONIC_EMA_ALPHA", "0.1"))
-
-# Audit-log on-chain checkpoint cadence — commit the rolling digest every N
-# records (§10). Cheap (one set_commitment per ~100 duels).
-AUDIT_CHAIN_COMMIT_EVERY = int(os.environ.get("TEUTONIC_AUDIT_CHAIN_COMMIT_EVERY", "100"))
 
 # Watchdogs / anti-stuckness safeguards.
 TICK_WARN_AFTER = int(os.environ.get("TEUTONIC_TICK_WARN_AFTER", "120"))
@@ -413,52 +397,6 @@ class R2:
                 pass
         return self.get(key)
 
-    def append_jsonl(self, key, record):
-        try:
-            line = json.dumps(record, default=str) + "\n"
-            existing = b""
-            try:
-                existing = self.client.get_object(Bucket=R2_BUCKET, Key=key)["Body"].read()
-            except Exception:
-                pass
-            self.client.put_object(
-                Bucket=R2_BUCKET, Key=key,
-                Body=existing + line.encode(),
-                ContentType="application/x-ndjson",
-            )
-        except Exception:
-            log.warning("R2 append_jsonl failed for %s (non-fatal)", key)
-
-    def append_jsonl_batch(self, key, records):
-        try:
-            lines = "".join(json.dumps(r, default=str) + "\n" for r in records)
-            existing = b""
-            try:
-                existing = self.client.get_object(Bucket=R2_BUCKET, Key=key)["Body"].read()
-            except Exception:
-                pass
-            self.client.put_object(
-                Bucket=R2_BUCKET, Key=key,
-                Body=existing + lines.encode(),
-                ContentType="application/x-ndjson",
-            )
-        except Exception:
-            log.warning("R2 append_jsonl_batch failed for %s (non-fatal)", key)
-
-    def put_raw(self, key, body, content_type):
-        try:
-            self.client.put_object(
-                Bucket=R2_BUCKET, Key=key, Body=body, ContentType=content_type,
-            )
-        except Exception:
-            log.warning("R2 put_raw failed for %s (non-fatal)", key)
-
-    def range_get(self, key, start, end):
-        return self.client.get_object(
-            Bucket=R2_BUCKET, Key=key, Range=f"bytes={start}-{end}"
-        )["Body"].read()
-
-
 # ---------------------------------------------------------------------------
 # Challenger validation
 # ---------------------------------------------------------------------------
@@ -475,7 +413,7 @@ def get_king_config(king_repo: str, king_digest: str = ""):
         return _king_config
     try:
         ref = ModelRef(king_repo, king_digest)
-        snapshot = materialize_model(ref, max_workers=8)
+        snapshot = materialize_model(ref, max_workers=4, config_only=True)
         with open(os.path.join(snapshot, "config.json")) as f:
             _king_config = json.load(f)
             _king_config_key = cache_key
@@ -506,7 +444,11 @@ def validate_challenger_config(model_repo: str, challenger_digest: str,
 
     try:
         ref = ModelRef(model_repo, challenger_digest)
-        snapshot = materialize_model(ref, max_workers=8)
+        # config-only fetch: pulls just config.json + tokenizer + index, not the
+        # ~8GB safetensors. The eval server downloads the full snapshot when it
+        # actually loads the model. Without this the validator's local disk
+        # fills after ~50 challengers (Qwen3-4B is 8GB; no eviction logic).
+        snapshot = materialize_model(ref, max_workers=4, config_only=True)
         with open(os.path.join(snapshot, "config.json")) as f:
             challenger_cfg = json.load(f)
         repo_files = list_snapshot_files(snapshot)
@@ -525,11 +467,16 @@ def validate_challenger_config(model_repo: str, challenger_digest: str,
         "tie_word_embeddings", "rope_theta", "max_position_embeddings",
         "max_seq_len",
     )
+    # Per-key compare: absent-in-king must mean absent-in-challenger too. A
+    # missing key on the king side previously short-circuited the check (so
+    # challengers could declare e.g. rope_scaling=YARN against a king that
+    # had no rope_scaling field), allowing silent arch divergence.
+    _SENTINEL = object()
     for key in _generic_lock + chain_config.EXTRA_LOCK_KEYS:
-        king_val = king_cfg.get(key)
-        chall_val = challenger_cfg.get(key)
-        if king_val is not None and chall_val is not None and king_val != chall_val:
-            return f"{key} mismatch: king={king_val} challenger={chall_val}"
+        king_val = king_cfg.get(key, _SENTINEL)
+        chall_val = challenger_cfg.get(key, _SENTINEL)
+        if king_val != chall_val:
+            return f"{key} mismatch: king={king_val if king_val is not _SENTINEL else '<absent>'} challenger={chall_val if chall_val is not _SENTINEL else '<absent>'}"
 
     if "auto_map" in challenger_cfg:
         return "auto_map present in config.json (custom modeling code is not allowed)"
@@ -571,44 +518,15 @@ import re
 _SAFETENSORS_SHARD_RE = re.compile(r"^model-\d{5}-of-\d{5}\.safetensors$")
 
 
-def get_all_revealed_commitments_tolerant(subtensor, netuid):
-    """bt 10.3's `get_all_revealed_commitments` raises if ANY commitment on the
-    subnet has non-hex content (legacy v1 plaintext, garbage from earlier in
-    chain history). One bad row poisons the whole scan and the validator can't
-    see any reveals at all. We replicate the query but isolate per-pair decode
-    failures so a single bad commitment doesn't wedge the entire pipeline.
-    """
-    from bittensor.core.chain_data.utils import decode_revealed_commitment_with_hotkey
-    try:
-        query = subtensor.query_map(
-            module="Commitments", name="RevealedCommitments", params=[netuid],
-        )
-    except Exception:
-        log.exception("query_map RevealedCommitments failed")
-        return {}
-    result = {}
-    bad = 0
-    for pair in query:
-        try:
-            hotkey_ss58, commitment_msg = decode_revealed_commitment_with_hotkey(pair)
-            result[hotkey_ss58] = commitment_msg
-        except Exception:
-            bad += 1
-    if bad:
-        log.warning("scan_reveals: skipped %d undecodable on-chain commitments", bad)
-    return result
-
-
-def scan_reveals(subtensor, netuid, completed_repos, seen_hotkeys, legacy_drop_set):
+def scan_reveals(subtensor, netuid, completed_repos, seen_hotkeys):
     """Pull v3 reveals; return latest per hotkey not previously enqueued.
 
     v3 format: `v3|<king_digest>|<challenger_repo>|<challenger_digest>` (see
     model_store.parse_reveal_v3). The embedded king_digest is *not* enforced
     here — the king may rotate between scan and process_challenge, so the
-    check belongs there (§4 stale-parent enforcement). v2 reveals are warned
-    once per hotkey then dropped — same legacy-drop pattern v2 used for v1.
+    check belongs there (§4 stale-parent enforcement).
     """
-    all_reveals = get_all_revealed_commitments_tolerant(subtensor, netuid)
+    all_reveals = subtensor.get_all_revealed_commitments(netuid)
     if not all_reveals:
         return []
 
@@ -620,15 +538,6 @@ def scan_reveals(subtensor, netuid, completed_repos, seen_hotkeys, legacy_drop_s
         try:
             king_digest, ref, author_hotkey = parse_reveal_v3(data)
         except ValueError:
-            # v2/legacy reveal — one-time-per-hotkey warn then drop.
-            if hotkey not in legacy_drop_set:
-                try:
-                    parse_reveal_payload(data)
-                    log.warning("dropping legacy v2 reveal from %s (miner must upgrade to v3)",
-                                hotkey[:16])
-                except ValueError as exc:
-                    log.warning("dropping malformed reveal from %s: %s", hotkey[:16], exc)
-                legacy_drop_set.add(hotkey)
             continue
         if author_hotkey != hotkey:
             # Chain side is the source of truth (commit-reveal keys reveals by
@@ -653,19 +562,13 @@ async def maybe_set_weights(subtensor, wallet, state, *, force: bool = False,
                             reason: str = "") -> bool:
     """Push 100% weight to BURN_UID. Burn-only by design — the validator never
     emits to miners. Eval + duel + dashboard continue to run for observability,
-    but the chain side is fixed at burn until the operator explicitly flips
-    `TEUTONIC_EMIT_TO_KING=1` (and the king-emission path is re-enabled).
+    but the chain side is fixed at burn.
 
     Async — the underlying `set_weights` call blocks for inclusion +
     finalization (~25-50s) so it runs in a thread executor to keep the event
     loop responsive. Routes through commit-reveal v4 when SN3 has CR enabled
     (asserted at startup). Rate-limited per `WEIGHT_INTERVAL`.
     """
-    if EMIT_TO_KING:
-        log.error("TEUTONIC_EMIT_TO_KING=1 is set but the king-emission code path "
-                  "is intentionally not wired. Refusing to set weights to a miner. "
-                  "Unset the env var to resume burn-only operation.")
-        return False
     try:
         current_block = subtensor.block
     except Exception:
@@ -749,23 +652,6 @@ def _model_key(repo: str, digest: str = "") -> str:
     return f"{repo}@{digest}" if digest else repo
 
 
-def delta_threshold(king_loss_ema: float | None) -> float:
-    """§6.4 adaptive effect floor: δ_t = DELTA_C * king_loss_t.
-
-    Cold start (king_loss_ema is None): return DELTA_C * 6.0 as a conservative
-    floor — assumes a worst-case king_loss of ~6 nats. Without this fallback
-    the first post-coronation duel auto-accepts any positive μ̂ (lcb > 0), which
-    is gameable. On the first successful duel `update_king_loss_ema` seeds the
-    EMA directly from the observed avg_king_loss, so this floor only governs
-    duel #1.
-    """
-    if king_loss_ema is None:
-        return DELTA_C * 6.0
-    if not (math.isfinite(king_loss_ema) and king_loss_ema > 0):
-        return DELTA_C * 6.0
-    return DELTA_C * king_loss_ema
-
-
 class State:
     def __init__(self, r2):
         self.r2 = r2
@@ -775,7 +661,6 @@ class State:
         self.failed_repos: set[str] = set()
         self.evaluated_repos: set[str] = set()
         self.completed_repos: set[str] = set()
-        self.legacy_drop_set: set[str] = set()
         self.stats = {"queued": 0, "accepted": 0, "rejected": 0, "failed": 0}
         self.counter = 0
         self.current_eval = None
@@ -787,27 +672,6 @@ class State:
         self.uid_emission_per_block: dict[str, float] = {}
         self.hotkey_coldkey: dict[str, str] = {}
         self.known_digests: dict[str, dict[str, str]] = {}
-        # §6.4: EMA of avg_king_loss across successful duels with the current
-        # king. None until the first duel post-coronation lands. Drives the
-        # adaptive δ_t shipped to the eval server for the next duel.
-        self.king_loss_ema: float | None = None
-        # §5/§3: when the king repo/digest becomes unresolvable, halt new
-        # dethrones + weight-sets until operator runs the resume protocol
-        # (env TEUTONIC_RESUME_KING="<repo>:<digest>" at startup).
-        self.king_lost: bool = False
-        # Consecutive failures of check_king_alive (resets on first success).
-        # Hippius is flaky; trip king_lost only after KING_ALIVE_FAILS_BEFORE_LOST
-        # consecutive ticks (see check_king_alive).
-        self.king_alive_consecutive_fails: int = 0
-        # §10: append-only counter + rolling sha256 over canonical-json
-        # bytes of every audit record. Every AUDIT_CHAIN_COMMIT_EVERY records
-        # the rolling digest is committed on-chain via set_commitment.
-        self.audit_counter: int = 0
-        self.audit_running_digest: str = ""
-        self.audit_last_committed_counter: int = 0
-        # Per-tick event buffer; flushed to state/history.jsonl in one
-        # append_jsonl_batch call instead of GET+PUT per event.
-        self.pending_events: list[dict] = []
         self.watchdog = {
             "started_at": _now(),
             "last_tick_started_at": None,
@@ -828,10 +692,6 @@ class State:
     def load(self):
         k = self.r2.get("king/current.json")
         if k:
-            # Strip dead previous_king chain — winner-takes-all means no
-            # ancestor walk is ever consulted (§9). One-shot migration from v2
-            # state schema; subsequent set_king calls never write the field.
-            k.pop("previous_king", None)
             self.king = k
         q = self.r2.get("state/queue.json")
         if q:
@@ -844,60 +704,22 @@ class State:
             self.completed_repos = set(cr.get("repos", []))
         st = self.r2.get("state/validator_state.json")
         if st:
-            loaded = st.get("stats", self.stats)
-            if "challenges" in loaded and "queued" not in loaded:
-                loaded["queued"] = loaded.pop("challenges")
-            loaded.setdefault("failed", 0)
-            loaded.setdefault("queued", 0)
-            self.stats = loaded
+            self.stats = st.get("stats", self.stats)
             self.counter = st.get("counter", 0)
             self.last_weight_block = st.get("last_weight_block", 0)
             self.last_winner_hotkey = st.get("last_winner_hotkey")
             self.known_digests = st.get("known_digests", {})
-            raw_ema = st.get("king_loss_ema")
-            self.king_loss_ema = raw_ema if isinstance(raw_ema, (int, float)) and math.isfinite(raw_ema) and raw_ema > 0 else None
-            self.king_lost = bool(st.get("king_lost", False))
-            self.audit_counter = int(st.get("audit_counter", 0))
-            self.audit_running_digest = st.get("audit_running_digest", "")
-            self.audit_last_committed_counter = int(st.get("audit_last_committed_counter", 0))
         h = self.r2.get("state/dashboard_history.json")
         if h:
             self.history = h.get("history", [])
         wd = self.r2.get("state/watchdog.json")
         if wd:
             self.watchdog.update(wd)
-        if not self.completed_repos:
-            for h_entry in self.history:
-                repo = h_entry.get("challenger_repo")
-                if repo:
-                    self.completed_repos.add(repo)
-            for q_entry in self.queue:
-                repo = q_entry.get("model_repo")
-                if repo:
-                    self.completed_repos.add(repo)
-            if self.completed_repos:
-                log.info("backfilled completed_repos from history+queue: %d repos",
-                         len(self.completed_repos))
 
-        reeval_leftover = [e for e in self.queue if e.get("reeval")]
-        if reeval_leftover:
-            for e in reeval_leftover:
-                repo = e.get("model_repo")
-                if repo:
-                    self.completed_repos.add(repo)
-            self.queue = [e for e in self.queue if not e.get("reeval")]
-            log.warning("dropped %d stale re-eval queue items (re-eval is disabled)",
-                        len(reeval_leftover))
-            try:
-                self.flush()
-            except Exception:
-                log.warning("post-purge flush failed (non-fatal)", exc_info=True)
-
-        log.info("loaded state: king=%s@%s queue=%d seen=%d completed=%d king_lost=%s",
+        log.info("loaded state: king=%s@%s queue=%d seen=%d completed=%d",
                  self.king.get("model_repo", "none"),
                  (self.king.get("king_digest") or "")[:12],
-                 len(self.queue), len(self.seen), len(self.completed_repos),
-                 self.king_lost)
+                 len(self.queue), len(self.seen), len(self.completed_repos))
 
     def flush(self):
         now = _now()
@@ -908,11 +730,6 @@ class State:
             "last_weight_block": self.last_weight_block,
             "last_winner_hotkey": self.last_winner_hotkey,
             "known_digests": self.known_digests,
-            "king_loss_ema": self.king_loss_ema,
-            "king_lost": self.king_lost,
-            "audit_counter": self.audit_counter,
-            "audit_running_digest": self.audit_running_digest,
-            "audit_last_committed_counter": self.audit_last_committed_counter,
             "updated_at": now,
         })
         self.r2.put("state/queue.json", {"pending": self.queue, "updated_at": now})
@@ -924,13 +741,6 @@ class State:
             "repos": sorted(self.completed_repos), "updated_at": now,
         })
         self.r2.put("state/watchdog.json", self.watchdog)
-        if self.pending_events:
-            buffered, self.pending_events = self.pending_events, []
-            self.r2.append_jsonl_batch("state/history.jsonl", buffered)
-
-    def event(self, data):
-        data.setdefault("timestamp", _now())
-        self.pending_events.append(data)
 
     def next_id(self):
         self.counter += 1
@@ -986,7 +796,6 @@ class State:
         if not defer_flush:
             self.flush()
             self.flush_dashboard(force=True)
-            self.event({"event": "queued", **entry})
         return cid
 
     def requeue_front(self, entry, *, reason: str, error_code: str = "", error_detail: str = ""):
@@ -1010,16 +819,6 @@ class State:
         self.current_eval = None
         self.flush()
         self.flush_dashboard(force=True)
-        self.event({
-            "event": "requeued_front",
-            "challenge_id": entry.get("challenge_id", "?"),
-            "hotkey": entry.get("hotkey", ""),
-            "model_repo": repo,
-            "retry_count": retry_count,
-            "reason": reason,
-            "error_code": error_code,
-            "error_detail": str(error_detail),
-        })
         log.warning("re-queued %s at front (retry %d/%d) due to %s: %s",
                     entry.get("challenge_id", "?"), retry_count,
                     MAX_TRANSIENT_EVAL_RETRIES, reason, error_detail)
@@ -1055,23 +854,8 @@ class State:
             "crowned_block": block, "challenge_id": challenge_id,
             "previous_repo": prev_repo,
         }
-        # §6.4: each coronation resets the EMA — the new king's loss
-        # distribution can differ wildly from the old one, so re-init from
-        # the first post-coronation duel rather than carrying stale stats.
-        self.king_loss_ema = None
         self.flush()
         self.flush_dashboard(force=True)
-        self.event({"event": "king_changed", "hotkey": hotkey, "reign": reign,
-                     "challenge_id": challenge_id, "model_repo": model_repo,
-                     "king_digest": king_digest})
-
-    def update_king_loss_ema(self, avg_king_loss: float):
-        if not (math.isfinite(avg_king_loss) and avg_king_loss > 0):
-            return
-        if self.king_loss_ema is None:
-            self.king_loss_ema = float(avg_king_loss)
-        else:
-            self.king_loss_ema = EMA_ALPHA * float(avg_king_loss) + (1 - EMA_ALPHA) * self.king_loss_ema
 
     def record_verdict(self, verdict, challenger_repo, hotkey):
         # Probe-rejected verdicts (eval_server.py probe-fail path) lack the
@@ -1161,60 +945,6 @@ class State:
             return None
         return ck[:COLDKEY_PREFIX_LEN]
 
-    def backfill_completed_from_chain(self, subtensor, netuid):
-        """One-shot migration: for every hotkey already in `seen` (legacy
-        hotkey-based dedup), look up their CURRENT chain reveal and add the
-        model_repo to `completed_repos`.
-
-        Without this, post-migration scan_reveals would re-enqueue every
-        previously-seen reveal whose verdict didn't make it into `history`
-        (stale entries, errors before LXXX cutover, etc.) — at ~10 min/eval
-        a 370-reveal stampede would queue ~62 hours of work. Idempotent."""
-        if not self.seen:
-            return
-        all_reveals = get_all_revealed_commitments_tolerant(subtensor, netuid)
-        if not all_reveals:
-            return
-        added = 0
-        for hotkey in list(self.seen):
-            entries = all_reveals.get(hotkey)
-            if not entries:
-                continue
-            block, data = max(entries, key=lambda e: e[0])
-            model_repo = ""
-            challenger_digest = ""
-            if isinstance(data, str) and data.startswith("v3|"):
-                try:
-                    _, ref, _ = parse_reveal_v3(data)
-                    model_repo = ref.repo
-                    challenger_digest = ref.digest
-                except ValueError:
-                    continue
-            else:
-                # Legacy v2 "v2|king|repo|digest" — colon-split is wrong;
-                # the original v2 form was pipe-delimited. Both pipe and
-                # the older colon form are tried so back-compat still works.
-                parts_pipe = data.split("|") if isinstance(data, str) else []
-                if len(parts_pipe) >= 3 and parts_pipe[0] == "v2":
-                    model_repo = parts_pipe[2].strip()
-                    if len(parts_pipe) >= 4:
-                        challenger_digest = parts_pipe[3].strip()
-                else:
-                    parts_colon = data.split(":", 2) if isinstance(data, str) else []
-                    if len(parts_colon) == 3:
-                        model_repo = parts_colon[1].strip()
-            if model_repo:
-                key = _model_key(model_repo, challenger_digest) if challenger_digest else model_repo
-                if key not in self.completed_repos:
-                    self.completed_repos.add(key)
-                    added += 1
-        if added:
-            log.info("backfilled completed_repos from chain (seen-hotkeys): +%d", added)
-            try:
-                self.flush()
-            except Exception:
-                log.warning("backfill flush failed (non-fatal)", exc_info=True)
-
     def _with_fresh_uid(self, entry):
         """Return a copy of `entry` whose `uid` and `coldkey` are re-derived
         from the current metagraph. Insert-time uids can go stale (deregistration,
@@ -1251,7 +981,7 @@ class State:
             alpha_usd = float(mkt.get("sn3_alpha_price_usd") or 0.0)
             sn3_alpha_per_block = float(mkt.get("sn3_alpha_per_block") or 0.0)
             king_hk = self.king.get("hotkey") if self.king else None
-            if king_hk and king_hk in self.uid_map and not self.king_lost:
+            if king_hk and king_hk in self.uid_map:
                 em_per_block = float(self.uid_emission_per_block.get(king_hk, 0.0))
                 alpha_per_hour = sn3_alpha_per_block * BLOCKS_PER_HOUR
                 tao_per_hour = alpha_per_hour * alpha_tao
@@ -1280,9 +1010,6 @@ class State:
                 },
                 "king": self.king,
                 "king_payout": king_payout,
-                "king_loss_ema": self.king_loss_ema,
-                "delta_threshold": delta_threshold(self.king_loss_ema),
-                "king_lost": self.king_lost,
                 "stats": self.stats,
                 "current_eval": self.current_eval,
                 "watchdog": self.watchdog,
@@ -1342,97 +1069,11 @@ class State:
         self.watchdog["restart_requested"] = True
         self.watchdog["restart_reason"] = reason
         self.set_phase("restart_requested", notes=reason)
-        self.event({"event": "watchdog_restart_requested", "reason": reason})
 
     def clear_restart_request(self):
         self.watchdog["restart_requested"] = False
         self.watchdog["restart_reason"] = ""
 
-
-
-# ---------------------------------------------------------------------------
-# King liveness
-# ---------------------------------------------------------------------------
-
-KING_ALIVE_FAILS_BEFORE_LOST = int(os.environ.get("TEUTONIC_KING_ALIVE_FAILS", "5"))
-
-
-def check_king_alive(state):
-    """Verify king repo+digest still resolvable. On failure: §3 halt-and-notify.
-    No auto-revert: reverting to a stale ancestor crowns a possibly-removed
-    checkpoint. Operator clears via TEUTONIC_RESUME_KING at startup.
-
-    Requires KING_ALIVE_FAILS_BEFORE_LOST (default 5) *consecutive* failures
-    before tripping `king_lost`. Single Hippius transient ⇒ retry next tick;
-    persistent failure ⇒ halt. Counter resets on the first success."""
-    if state.king_lost:
-        return False
-    repo = state.king.get("model_repo", "")
-    rev = state.king.get("king_digest", "")
-    if not repo or not rev:
-        state.king_alive_consecutive_fails = 0
-        return True
-    try:
-        ensure_ref_exists(ModelRef(repo, rev))
-        state.king_alive_consecutive_fails = 0
-        return True
-    except Exception as exc:
-        state.king_alive_consecutive_fails = getattr(state, "king_alive_consecutive_fails", 0) + 1
-        if state.king_alive_consecutive_fails >= KING_ALIVE_FAILS_BEFORE_LOST:
-            handle_king_lost(state, repo, rev,
-                             reason=f"king unresolvable for {state.king_alive_consecutive_fails} consecutive ticks: {exc}")
-            return False
-        log.warning("king liveness check failed (%d/%d): %s",
-                    state.king_alive_consecutive_fails, KING_ALIVE_FAILS_BEFORE_LOST, exc)
-        return True
-
-
-def handle_king_lost(state, king_repo, king_digest, *, reason: str):
-    log.error("KING LOST: repo=%s digest=%s — halting until operator intervention",
-              king_repo, king_digest[:19])
-    state.king_lost = True
-    state.flush()
-    state.flush_dashboard()
-    state.event({"event": "king_lost", "repo": king_repo,
-                 "digest": king_digest, "reason": reason})
-    try:
-        asyncio.create_task(notify_king_lost(state.king, reason))
-    except RuntimeError:
-        # Outside an event loop (synchronous startup path) — best-effort, skip.
-        pass
-
-
-async def notify_king_lost(king: dict, reason: str):
-    """Loud Discord ping: king repo/digest unresolvable, validator halted."""
-    if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
-        return
-    repo = (king or {}).get("model_repo", "?")
-    rev = ((king or {}).get("king_digest") or "")[:12]
-    hk = ((king or {}).get("hotkey") or "")[:16]
-    lines = [
-        "**KING LOST — Validator Halted**",
-        f"**Repo:** `{repo}`" + (f" (`{rev}`)" if rev else ""),
-        f"**Hotkey:** `{hk}...`" if hk else "",
-        f"**Reason:** {reason}",
-        "",
-        "New dethrones and weight-sets paused. Operator must set "
-        "`TEUTONIC_RESUME_KING=<repo>:<digest>` and restart to resume.",
-    ]
-    embed = {
-        "title": "@here KING LOST",
-        "description": "\n".join(l for l in lines if l is not None),
-        "color": 0xCC0000,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            await client.post(
-                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
-                headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}",
-                         "Content-Type": "application/json"},
-                json={"content": "@here", "embeds": [embed]},
-            )
-    except Exception:
-        log.warning("discord king-lost notify failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1472,8 +1113,6 @@ async def _stream_events_with_idle_watchdog(stream, state, cid):
                 if idle >= STREAM_IDLE_WARN_AFTER and not warned:
                     warned = True
                     log.warning("%s: eval stream idle for %.0fs", cid, idle)
-                    state.event({"event": "eval_stream_idle_warning", "challenge_id": cid,
-                                 "idle_s": round(idle, 1)})
                     state.set_phase("eval_stream_idle", challenge_id=cid,
                                     notes=f"idle {idle:.0f}s waiting for eval stream")
                     state.flush_dashboard()
@@ -1553,95 +1192,6 @@ def _is_transient_eval_error(exc: Exception | str) -> tuple[bool, str]:
     return False, ""
 
 
-def _canonical_json(obj) -> bytes:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False).encode()
-
-
-async def write_audit_record(state, r2, subtensor, wallet, cid, entry,
-                              king_repo, king_digest, challenger_repo,
-                              challenger_digest, block_hash, eval_block,
-                              delta_for_duel, verdict):
-    """§10 reproducible audit trail. One record per duel — accepted or not —
-    written to state/audit/<cid>.json on R2; every AUDIT_CHAIN_COMMIT_EVERY
-    records, the rolling sha256 over canonical-json bytes is committed on chain
-    via set_commitment so external auditors can replay the verdict.
-    """
-    hotkey = entry.get("hotkey", "")
-    record = {
-        "round_id": cid,
-        "block_hash_at_reveal": block_hash,
-        "eval_block": eval_block,
-        "hotkey": hotkey,
-        "king_repo": king_repo,
-        "king_digest": king_digest,
-        "challenger_repo": challenger_repo,
-        "challenger_digest": challenger_digest,
-        "public_corpus_digest": verdict.get("public_corpus_digest", ""),
-        "public_corpus_digest_fallback": verdict.get("public_corpus_digest_fallback", False),
-        "public_seed": verdict.get("public_seed", ""),
-        "public_indices_digest": verdict.get("public_indices_digest", ""),
-        "private_pool_digest": verdict.get("private_pool_digest", ""),
-        "n_public_seqs": verdict.get("n_public_seqs", 0),
-        "n_private_seqs": verdict.get("n_private_seqs", 0),
-        "boot_seed": verdict.get("boot_seed", ""),
-        "delta_threshold": delta_for_duel,
-        "king_loss_ema": state.king_loss_ema,
-        "avg_king_loss": verdict.get("avg_king_loss", 0),
-        "avg_challenger_loss": verdict.get("avg_challenger_loss", 0),
-        "mu_hat": verdict.get("mu_hat", 0),
-        "lcb": verdict.get("lcb", 0),
-        "accepted": bool(verdict.get("accepted", False)),
-        "eval_code_digest": verdict.get("eval_code_digest", ""),
-        "validator_hotkey": wallet.hotkey.ss58_address,
-    }
-    body = _canonical_json(record)
-    record_hash = hashlib.sha256(body).digest()
-    sig = None
-    for attempt in range(3):
-        try:
-            sig = "0x" + wallet.hotkey.sign(record_hash).hex()
-            break
-        except Exception as exc:
-            log.error("audit signing failed (attempt %d/3): %s", attempt + 1, exc)
-            await asyncio.sleep(0.5 * (attempt + 1))
-    if sig is None:
-        # Audit chain integrity is the trust anchor (§10). Refuse to fold a
-        # signature-less record into the rolling digest — sideline it for
-        # operator review and keep the chain auditable.
-        r2.put_dashboard_raw(f"state/audit/unsigned/{cid}.json", body, "application/json")
-        log.error("AUDIT SIDELINED: cid=%s — signing failed 3x. Record at state/audit/unsigned/%s.json. "
-                  "Investigate keypair access before continuing.", cid, cid)
-        state.event({"event": "audit_sidelined_signing_failed", "cid": cid})
-        return
-    record["validator_signature"] = sig
-    final_body = _canonical_json(record)
-    r2.put_dashboard_raw(f"state/audit/{cid}.json", final_body, "application/json")
-
-    state.audit_counter += 1
-    prev = bytes.fromhex(state.audit_running_digest) if state.audit_running_digest else b""
-    state.audit_running_digest = hashlib.sha256(prev + final_body).hexdigest()
-
-    if state.audit_counter - state.audit_last_committed_counter >= AUDIT_CHAIN_COMMIT_EVERY:
-        payload = f"v3-audit|{state.audit_last_committed_counter + 1}-{state.audit_counter}|{state.audit_running_digest}"
-        try:
-            resp = subtensor.set_commitment(
-                wallet=wallet, netuid=NETUID, data=payload,
-                wait_for_inclusion=False, wait_for_finalization=False,
-                wait_for_revealed_execution=False,
-            )
-            if not resp.success:
-                log.error("audit digest chain commit failed: %s", resp.message)
-            else:
-                state.audit_last_committed_counter = state.audit_counter
-                log.info("committed audit digest range to chain: %s", payload)
-                state.event({"event": "audit_digest_committed",
-                             "counter": state.audit_counter,
-                             "rolling_digest": state.audit_running_digest})
-        except Exception:
-            log.exception("audit digest chain commit failed (will retry next batch)")
-
-
 async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=True):
     cid = entry["challenge_id"]
     hotkey = entry["hotkey"]
@@ -1668,21 +1218,19 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     # between scan_reveals and here. A challenger trained against king K1
     # who arrives after the K2 coronation is dropped — they raced and lost,
     # not the miner's fault but also not a real challenger to the current king.
-    reveal_king_digest = (entry.get("king_digest_at_reveal") or "").lower()
-    current_king_digest = (state.king.get("king_digest") or "").lower()
-    if reveal_king_digest:
-        current_bare = current_king_digest.split(":", 1)[-1] if current_king_digest else ""
-        if reveal_king_digest != current_bare:
+    # Both digests carry their format prefix (sha256:/hf:); comparing the
+    # canonicalised (strip+lower) forms matches format AND value because the
+    # two prefixes are disjoint.
+    reveal_canon = (entry.get("king_digest_at_reveal") or "").strip().lower()
+    current_canon = (state.king.get("king_digest") or "").strip().lower()
+    if reveal_canon:
+        if reveal_canon != current_canon:
             log.warning("stale_parent: %s committed against king %s, current is %s",
-                        cid, reveal_king_digest[:12], current_bare[:12])
+                        cid, reveal_canon, current_canon)
             state.failed_repos.add(model_key)
             state.record_failure(entry, "stale_parent",
-                                  f"reveal pinned king {reveal_king_digest[:12]}, "
-                                  f"current king is {current_bare[:12]}")
-            state.event({"event": "stale_parent", "challenge_id": cid,
-                         "hotkey": hotkey, "model_repo": model_repo,
-                         "reveal_king_digest": reveal_king_digest,
-                         "current_king_digest": current_bare})
+                                  f"reveal pinned king {reveal_canon}, "
+                                  f"current king is {current_canon}")
             return
 
     expected_ck_prefix = state.expected_coldkey_prefix(hotkey)
@@ -1698,9 +1246,6 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
             log.warning("rejecting %s (%s): %s", cid, model_repo, reason)
             state.failed_repos.add(model_key)
             state.record_failure(entry, "coldkey_required", reason)
-            state.event({"event": "coldkey_required", "challenge_id": cid,
-                         "hotkey": hotkey, "model_repo": model_repo,
-                         "expected_prefix": expected_ck_prefix})
             return
     else:
         # Metagraph hasn't surfaced this hotkey's coldkey yet (fresh
@@ -1734,17 +1279,19 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
                               "miner must resubmit with the new miner.py")
         return
     if not DIGEST_RE.match(challenger_digest):
-        log.warning("eval %s: digest %r is not a valid OCI sha256 digest",
+        log.warning("eval %s: digest %r is not a valid digest "
+                    "(expected sha256:<64hex> or hf:<40hex>)",
                     cid, challenger_digest[:32])
         state.failed_repos.add(model_key)
         state.record_failure(entry, "digest_malformed",
-                              f"on-chain digest {challenger_digest!r} is not sha256:<64 hex>")
+                              f"on-chain digest {challenger_digest!r} is not a valid "
+                              f"digest (expected sha256:<64hex> or hf:<40hex>)")
         return
     try:
         state.set_phase("hippius_metadata", challenge_id=cid,
                          notes=f"verifying {model_repo}@{challenger_digest[:19]}")
         ref = ModelRef(model_repo, challenger_digest)
-        ensure_ref_exists(ref)
+        materialize_model(ref, max_workers=4, config_only=True)
         state.remember_digest(hotkey, model_repo, challenger_digest)
         log.info("challenger %s pinned at digest %s (committed on-chain)",
                  model_repo, challenger_digest[:19])
@@ -1766,15 +1313,22 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         log.warning("rejecting %s (%s): %s", cid, model_repo, rejection)
         state.failed_repos.add(model_key)
         state.record_failure(entry, "config_rejected", rejection)
-        state.event({"event": "config_rejected", "challenge_id": cid,
-                     "model_repo": model_repo, "reason": rejection})
         return
 
-    block_hash = "default"
+    # §6.1 + §10: holdout seed material is `block_hash_at_reveal || hotkey`,
+    # so the pinned block_hash MUST be the reveal-commit block's hash (which
+    # an external auditor can fetch from the chain) — NOT the eval-time block,
+    # which is arbitrary minutes/hours later. Use the entry's reveal block;
+    # only fall back to the eval block if scan didn't capture one.
     eval_block = _safe_block(subtensor)
     try:
         eval_block = subtensor.block
-        block_hash = subtensor.get_block_hash(eval_block) or "default"
+    except Exception:
+        pass
+    reveal_block = int(entry.get("block", 0) or eval_block)
+    block_hash = "default"
+    try:
+        block_hash = subtensor.get_block_hash(reveal_block) or "default"
     except Exception:
         pass
 
@@ -1831,11 +1385,6 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     }
     state.flush_dashboard(force=True)
 
-    # δ_t for this duel: if we have an EMA, use it; otherwise pass 0 and the
-    # eval server interprets that as "use avg_king_loss from this very duel to
-    # compute δ" so the first post-coronation duel still has a meaningful bar.
-    delta_for_duel = delta_threshold(state.king_loss_ema)
-
     verdict = None
     async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=30.0)) as client:
         eval_payload = {
@@ -1846,7 +1395,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
             "shard_key": shard_key,
             "king_digest": king_digest,
             "challenger_digest": challenger_digest,
-            "delta_threshold": delta_for_duel,
+            "delta_threshold": 0.0025,
             "n_public": EVAL_N_PUBLIC,
             "n_private": EVAL_N_PRIVATE,
             "n_bootstrap": 10_000,
@@ -1958,50 +1507,26 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     else:
         state.stats["rejected"] += 1
 
-    # §6.4: update king_loss_ema on every successful duel (accepted or not).
-    # The EMA reflects the *current king's* loss against the holdout
-    # distribution, not the challenger's — drives δ for the next duel.
-    avg_king_loss = float(verdict.get("avg_king_loss") or 0)
-    if avg_king_loss > 0:
-        state.update_king_loss_ema(avg_king_loss)
-
-    # §10 audit record — pinned for every duel, accepted or rejected. External
-    # auditors can recompute mu_hat / lcb from the public inputs (king bytes,
-    # challenger bytes, public corpus snapshot, public_seed, public_indices,
-    # boot_seed) and the private-pool digest commits the validator to the
-    # holdout half it cannot publish.
-    await write_audit_record(state, r2, subtensor, wallet, cid, entry,
-                              king_repo, king_digest, model_repo,
-                              challenger_digest, block_hash, eval_block,
-                              delta_for_duel, verdict)
-
     state.flush_dashboard(force=True)
-    state.event({"event": "eval_completed", "challenge_id": cid,
-                 "hotkey": hotkey, "accepted": accepted, **verdict})
 
     if accepted:
-        if state.king_lost:
-            # Halt-and-notify is sticky until operator runs the resume protocol;
-            # we recorded the duel + audit, but do not crown a new king.
-            log.warning("%s: dethroning suppressed — king_lost=True, operator must resume", cid)
-        else:
-            prev_repo = state.king.get("model_repo") if state.king else ""
-            dethrone_block = entry.get("block", 0) or _safe_block(subtensor)
-            state.set_king(hotkey, model_repo, dethrone_block,
-                           challenge_id=cid, king_digest=challenger_digest)
-            state.last_winner_hotkey = hotkey
-            try:
-                await maybe_set_weights(subtensor, wallet, state,
-                                        force=True, reason="dethrone")
-            except Exception:
-                log.exception("force weight-set after dethrone failed")
-            await notify_new_king({
-                "hotkey": hotkey,
-                "model_repo": model_repo,
-                "reign_number": state.king.get("reign_number", 0),
-                "king_digest": challenger_digest,
-                "previous_repo": prev_repo,
-            }, verdict)
+        prev_repo = state.king.get("model_repo") if state.king else ""
+        dethrone_block = entry.get("block", 0) or _safe_block(subtensor)
+        state.set_king(hotkey, model_repo, dethrone_block,
+                       challenge_id=cid, king_digest=challenger_digest)
+        state.last_winner_hotkey = hotkey
+        try:
+            await maybe_set_weights(subtensor, wallet, state,
+                                    force=True, reason="dethrone")
+        except Exception:
+            log.exception("force weight-set after dethrone failed")
+        await notify_new_king({
+            "hotkey": hotkey,
+            "model_repo": model_repo,
+            "reign_number": state.king.get("reign_number", 0),
+            "king_digest": challenger_digest,
+            "previous_repo": prev_repo,
+        }, verdict)
 
     state.flush()
     state.flush_dashboard(force=True)
@@ -2038,10 +1563,6 @@ async def main():
         sys.exit(2)
 
     state.refresh_uid_map(subtensor, NETUID)
-    # One-shot chain backfill of completed_repos for already-seen hotkeys.
-    # Prevents post-migration re-eval stampede (see method docstring).
-    # Idempotent — after first run, completed_repos and seen converge.
-    state.backfill_completed_from_chain(subtensor, NETUID)
     state.flush_dashboard(force=True)
 
     html_path = os.path.join(os.path.dirname(__file__) or ".", "website", "index.html")
@@ -2064,45 +1585,12 @@ async def main():
         )
         log.info("uploaded dashboard to Hippius (build=%s)", build_id)
 
-    force_seed = os.environ.get("TEUTONIC_FORCE_SEED_KING", "0") == "1"
-    if force_seed:
-        state.king = {}
-        state.king_lost = False
-        log.warning("TEUTONIC_FORCE_SEED_KING=1: replacing king with chain seed")
-
-    # Operator king-resume hatch (§E). When the validator has halted on
-    # king_lost, the operator sets TEUTONIC_RESUME_KING=<repo>:<sha256_digest>
-    # before restarting; we replace state.king with that pinned ref and clear
-    # the halt flag. Verified resolvable before accepting.
-    resume = os.environ.get("TEUTONIC_RESUME_KING", "").strip()
-    if resume:
-        try:
-            r_repo, r_digest = resume.rsplit(":", 1)
-            if not r_digest.startswith("sha256:"):
-                r_digest = f"sha256:{r_digest}"
-            resume_ref = ModelRef(r_repo, r_digest)
-            ensure_ref_exists(resume_ref)
-            log.warning("TEUTONIC_RESUME_KING set: replacing king with %s", resume_ref.immutable_ref)
-            # Any in-flight queue/evaluated entries target the previous (now
-            # lost) king; they'd all drop as stale_parent. Clear so a fresh
-            # scan against the new king's digest is the only source.
-            state.queue.clear()
-            state.evaluated_repos.clear()
-            state.set_king(wallet.hotkey.ss58_address, resume_ref.repo,
-                           subtensor.block, challenge_id="resume",
-                           king_digest=resume_ref.digest)
-            state.king_lost = False
-            state.flush()
-        except Exception as exc:
-            log.error("TEUTONIC_RESUME_KING=%r could not be resolved: %s", resume, exc)
-            sys.exit(1)
-
     if not state.king:
         if not SEED_DIGEST:
             log.error("set TEUTONIC_SEED_DIGEST for the initial Hippius seed king")
             sys.exit(1)
         seed_ref = ModelRef(SEED_REPO, SEED_DIGEST)
-        ensure_ref_exists(seed_ref)
+        materialize_model(seed_ref, max_workers=4, config_only=True)
         log.info("seed king %s", seed_ref.immutable_ref)
         state.set_king(wallet.hotkey.ss58_address, seed_ref.repo,
                        subtensor.block, king_digest=seed_ref.digest)
@@ -2134,14 +1622,6 @@ async def main():
         tick_started_monotonic = _monotonic_now()
         state.begin_tick()
         try:
-            if not check_king_alive(state):
-                # halt-and-notify: do not auto-revert, do not enqueue new
-                # reveals or set weights until operator clears king_lost.
-                if state.queue:
-                    log.warning("king_lost: leaving %d queued challenges in place but not processing", len(state.queue))
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-
             if _monotonic_now() - tick_started_monotonic > TICK_WARN_AFTER:
                 log.warning("tick already running for %.0fs before uid refresh",
                             _monotonic_now() - tick_started_monotonic)
@@ -2154,8 +1634,7 @@ async def main():
                 state.market = tmc
 
             state.set_phase("scan_reveals", notes="polling chain for reveals")
-            reveals = scan_reveals(subtensor, NETUID, state.completed_repos, state.seen,
-                                    state.legacy_drop_set)
+            reveals = scan_reveals(subtensor, NETUID, state.completed_repos, state.seen)
             if reveals:
                 # If any newly-revealed hotkey isn't in the uid_map snapshot we
                 # just refreshed (registration happened *between* refresh and
@@ -2177,7 +1656,6 @@ async def main():
                 if queued_count:
                     state.flush()
                     state.flush_dashboard()
-                    state.event({"event": "queued_batch", "count": queued_count, "kind": "new"})
 
             while state.queue:
                 # Per-eval watchdog: reset timer for each queue item so we only
@@ -2273,8 +1751,7 @@ async def main():
                                         notes=str(exc))
                         state.flush_dashboard()
 
-                fresh = scan_reveals(subtensor, NETUID, state.completed_repos, state.seen,
-                                      state.legacy_drop_set)
+                fresh = scan_reveals(subtensor, NETUID, state.completed_repos, state.seen)
                 if fresh:
                     # See same comment in tick scan above: refresh uid_map
                     # eagerly so the dashboard never shows uid="--" for a
@@ -2293,8 +1770,6 @@ async def main():
                     if queued_count:
                         state.flush()
                         state.flush_dashboard()
-                        state.event({"event": "queued_batch",
-                                     "count": queued_count, "kind": "mid-cycle"})
 
                 try:
                     await maybe_set_weights(subtensor, wallet, state,
@@ -2343,7 +1818,6 @@ async def main():
             if tick_elapsed >= TICK_WARN_AFTER:
                 log.warning("tick duration %.1fs exceeded warn threshold %ss",
                             tick_elapsed, TICK_WARN_AFTER)
-                state.event({"event": "tick_slow", "duration_s": round(tick_elapsed, 1)})
             flush_age = _age_seconds(state.watchdog.get("last_state_flush_at"))
             if flush_age is not None and flush_age >= STATE_FLUSH_INTERVAL:
                 state.flush()

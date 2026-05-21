@@ -215,8 +215,8 @@ def main():
     log.info("uploaded to %s", challenger_ref.immutable_ref)
 
     # On-chain reveal: v3|king_digest|repo|challenger_digest|author_hotkey.
-    # Both digests are bare 64-hex sha256; king_digest is pulled straight from
-    # the dashboard (full digest, not a truncation).
+    # Digests carry their format prefix (sha256:/hf:); king_digest is pulled
+    # straight from the dashboard, challenger_digest from the upload.
     payload = build_reveal_v3(king_digest, challenger_ref, my_hotkey)
     log.info("submitting reveal: %s", payload)
 

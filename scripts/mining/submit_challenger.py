@@ -37,7 +37,7 @@ from pathlib import Path
 
 import bittensor as bt
 
-from model_store import ModelRef, build_reveal_v3
+from model_store import DIGEST_RE, ModelRef, build_reveal_v3
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s [submit] %(message)s",
@@ -62,15 +62,13 @@ def main():
     args = ap.parse_args()
 
     v = json.loads(Path(args.verdict).read_text())
-    # v3 requires the FULL 64-hex king digest, not a 16-char prefix. The
-    # train_challenger verdict file format hasn't been updated yet, so
-    # surface the right field name and fail hard if it's missing rather
-    # than silently dropping the submission.
+    # v3 requires the full king digest with format prefix, not a 16-char
+    # truncation. train_challenger.py must persist `king_digest` exactly as it
+    # appears on the dashboard (sha256:<64hex> or hf:<40hex>).
     king_digest_full = v.get("king_digest") or v.get("king_hash")
-    if not king_digest_full or len(king_digest_full.replace("sha256:", "")) < 64:
-        # TODO: train_challenger.py must persist `king_digest` (full 64-hex).
-        log.error("verdict missing full 64-hex `king_digest`; update train_challenger.py "
-                  "to write the full king sha256 from the dashboard (not a 16-char prefix)")
+    if not king_digest_full or not DIGEST_RE.match(king_digest_full):
+        log.error("verdict missing valid `king_digest` (need sha256:<64hex> or hf:<40hex>); "
+                  "update train_challenger.py to write the full king digest from the dashboard")
         sys.exit(7)
     repo = v.get("uploaded_repo") or v.get("model_repo")
     digest = v.get("uploaded_digest") or v.get("model_digest")

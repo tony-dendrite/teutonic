@@ -190,6 +190,23 @@ def _load_file_list(r2, cfg: RawDatasetConfig) -> list[dict]:
     return files
 
 
+_HIPPIUS_S3_CONFIG = None
+
+
+def _hippius_transfer_config():
+    """Hippius S3 rejects boto3's default parallel ranged GETs (observed live
+    against `teutonic-sn3` parquets ~2 GiB each: every multi-part download
+    exhausts retries while single-threaded GETs stream at ~70 MB/s). Force
+    a single sequential GET path — slower than R2's parallel ranges but
+    actually completes.
+    """
+    global _HIPPIUS_S3_CONFIG
+    if _HIPPIUS_S3_CONFIG is None:
+        from boto3.s3.transfer import TransferConfig
+        _HIPPIUS_S3_CONFIG = TransferConfig(use_threads=False, multipart_threshold=10 * 1024**4)
+    return _HIPPIUS_S3_CONFIG
+
+
 def _download_parquet(r2, cfg: RawDatasetConfig, key: str) -> pathlib.Path:
     cfg.cache_dir.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(key.encode()).hexdigest()[:24]
@@ -202,7 +219,8 @@ def _download_parquet(r2, cfg: RawDatasetConfig, key: str) -> pathlib.Path:
     tmp = pathlib.Path(tmp_name)
     try:
         log.info("downloading raw parquet s3://%s/%s", r2.ds_bucket, key)
-        r2.ds_client.download_file(r2.ds_bucket, key, str(tmp))
+        r2.ds_client.download_file(r2.ds_bucket, key, str(tmp),
+                                   Config=_hippius_transfer_config())
         tmp.replace(path)
     except Exception:
         tmp.unlink(missing_ok=True)

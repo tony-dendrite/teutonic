@@ -37,6 +37,7 @@ import chain_config  # noqa: E402
 from model_store import (  # noqa: E402
     DIGEST_RE,
     ModelRef,
+    list_remote_files,
     list_snapshot_files,
     materialize_model,
     parse_reveal_v3,
@@ -451,7 +452,9 @@ def validate_challenger_config(model_repo: str, challenger_digest: str,
         snapshot = materialize_model(ref, max_workers=4, config_only=True)
         with open(os.path.join(snapshot, "config.json")) as f:
             challenger_cfg = json.load(f)
-        repo_files = list_snapshot_files(snapshot)
+        # Snapshot lists only the config-only subset, so use the remote
+        # manifest/file-tree to verify safetensors are actually in the repo.
+        repo_files = list_remote_files(ref)
     except Exception as e:
         return f"cannot materialize Hippius model snapshot: {e}"
 
@@ -518,6 +521,32 @@ import re
 _SAFETENSORS_SHARD_RE = re.compile(r"^model-\d{5}-of-\d{5}\.safetensors$")
 
 
+def _decode_commitment_pair(pair):
+    """Return (hotkey_ss58, [(block, payload), ...]) for one RevealedCommitments row.
+
+    bittensor 10.3's `decode_revealed_commitment` assumes the payload is hex
+    and does `bytes.fromhex()` on it — but substrate hands back the raw
+    commitment bytes already wrapped in a Python str via latin-1, with a
+    SCALE compact-length prefix in front. We strip the prefix and decode the
+    rest as UTF-8 ourselves.
+    """
+    key, data = pair
+    if not isinstance(key, str):
+        raise ValueError(f"unexpected commitment key type {type(key).__name__}")
+    out = []
+    for entry in data:
+        text, block = entry
+        if not isinstance(text, str):
+            raise ValueError(f"unexpected commitment payload type {type(text).__name__}")
+        raw = text.encode("latin-1")
+        if not raw:
+            raise ValueError("empty commitment payload")
+        mode = raw[0] & 0b11
+        offset = 1 if mode == 0 else 2 if mode == 1 else 4
+        out.append((block, raw[offset:].decode("utf-8", errors="ignore")))
+    return key, out
+
+
 def scan_reveals(subtensor, netuid, completed_repos, seen_hotkeys):
     """Pull v3 reveals; return latest per hotkey not previously enqueued.
 
@@ -525,8 +554,28 @@ def scan_reveals(subtensor, netuid, completed_repos, seen_hotkeys):
     model_store.parse_reveal_v3). The embedded king_digest is *not* enforced
     here — the king may rotate between scan and process_challenge, so the
     check belongs there (§4 stale-parent enforcement).
+
+    Per-pair decode via _decode_commitment_pair instead of bittensor's
+    `decode_revealed_commitment_with_hotkey`, which (a) raises on any single
+    bad legacy row and poisons the whole scan, and (b) assumes hex-encoded
+    payloads in bt 10.3 even though substrate returns raw bytes. Both bugs
+    have a single fix: decode it ourselves.
     """
-    all_reveals = subtensor.get_all_revealed_commitments(netuid)
+    try:
+        query = subtensor.query_map(module="Commitments", name="RevealedCommitments", params=[netuid])
+    except Exception:
+        log.exception("query_map RevealedCommitments failed")
+        return []
+    all_reveals = {}
+    bad = 0
+    for pair in query:
+        try:
+            hotkey_ss58, commitment_msg = _decode_commitment_pair(pair)
+            all_reveals[hotkey_ss58] = commitment_msg
+        except Exception:
+            bad += 1
+    if bad:
+        log.warning("scan_reveals: skipped %d undecodable on-chain commitments", bad)
     if not all_reveals:
         return []
 

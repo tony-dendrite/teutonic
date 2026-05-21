@@ -148,6 +148,25 @@ def list_snapshot_files(snapshot: str | os.PathLike[str]) -> list[str]:
     )
 
 
+def list_remote_files(ref: ModelRef) -> list[str]:
+    """Return the file list for a Hippius/HF ref without downloading content.
+
+    Reads OCI manifest layer titles for sha256: digests; queries the HF API
+    file tree for hf: digests. Use to gate on file presence (e.g. is
+    `*.safetensors` actually there) without paying the snapshot download
+    cost.
+    """
+    if ref.digest.startswith("hf:"):
+        from huggingface_hub import HfApi
+        api = HfApi(token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY"))
+        return sorted(api.list_repo_files(repo_id=ref.repo, revision=ref.digest[3:]))
+    from hippius_hub._oci import fetch_manifest, layer_titles
+    from hippius_hub.auth import get_oci_bearer_token, resolve_token_value
+    oci_token = get_oci_bearer_token(ref.repo, resolve_token_value(HUB_TOKEN), push=False)
+    manifest = fetch_manifest("https://registry.hippius.com", ref.repo, ref.digest, oci_token)
+    return sorted(layer_titles(manifest))
+
+
 def snapshot_size(snapshot: str | os.PathLike[str], files: Iterable[str] | None = None) -> int:
     root = Path(snapshot)
     paths = (root / f for f in files) if files is not None else (p for p in root.rglob("*") if p.is_file())

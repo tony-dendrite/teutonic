@@ -643,48 +643,42 @@ def load_model(repo, device, label="model", force_download=False, revision=None,
 # The attack pattern: a miner takes a good model and "locks" the weights so
 # it still wins the paired-CE eval but resists further fine-tuning. If this
 # works, their model wins emissions forever — no one can continue-pretrain
-# and improve on it. The five layers below each catch a different variant of
+# and improve on it. The layers below each catch a different variant of
 # the attack. ANY one tripping ⇒ the probe returns ok=False (the eval server
 # rejects the candidate as untrainable).
 #
-# Layer 1 — Static LayerNorm/RMSNorm weight cap.
-#     |weight|.max() across every *Norm module must be <= FINETUNE_NORM_WEIGHT_MAX.
-#     Catches the obvious "pump LN gains by 1000x to explode gradients" trick.
-#     Runs before any compute so a watermarked model burns ~0 GPU time to reject.
-#
-# Layer 2 — Live forward + backward, finiteness check.
+# Layer 1 — Live forward + backward, finiteness check.
 #     Forward must not raise. Loss must be finite. Backward must not raise.
 #     No p.grad may contain NaN/Inf. This is the property pretraining needs:
 #     if the model can't even produce one finite gradient on a real batch, no
 #     amount of LR tuning will save the next training run.
 #
-# Layer 3 — Global gradient L2 norm cap (FINETUNE_GRAD_NORM_MAX).
+# Layer 2 — Global gradient L2 norm cap (FINETUNE_GRAD_NORM_MAX).
 #     Catches generic loss-surface-rigging. Pretraining LRs are 1e-4 to 1e-3,
 #     so a |grad| of 500 already moves weights by 0.05–0.5 per step — that
 #     destroys any model. If the candidate's grads are this big out of the
 #     box, it's brittle by construction.
 #
-# Layer 4 — Per-parameter-type gradient L2 norm cap.
+# Layer 3 — Per-parameter-type gradient L2 norm cap.
 #     Same threshold but applied per category (attn / ffn / embed / lm_head /
 #     norm / bias / other). Catches surgical attacks (embedding poisoning,
 #     lm_head poisoning, single-group perturbations) that blow up one bucket
 #     while keeping the global norm under the cap.
 #
-# Layer 5 — Multi-seed rotation across random-token batches.
+# Layer 4 — Multi-seed rotation across random-token batches.
 #     Run PROBE_SEEDS independent random batches, each going through layers
-#     2-4. Random tokens are correct here because pretraining sees an
+#     1-3. Random tokens are correct here because pretraining sees an
 #     arbitrary input distribution and brittleness lives in parameter-space
 #     geometry, not in the probe text. Multiple seeds force the candidate to
 #     be fine-tunable on more than one fixed batch — a miner that hard-codes
 #     a regularizer around one batch fails on the others.
-
-# Static cap — any LN/RMSNorm tensor with |weight|.max() above this is
-# rejected without running compute. Honest gemma3-style RMSNorm gains sit
-# below ~1.5; allowing 30 covers exotic-but-legit scales while sitting two
-# orders of magnitude under the 1000x watermark attack.
-FINETUNE_NORM_WEIGHT_MAX = float(os.environ.get(
-    "TEUTONIC_FINETUNE_NORM_WEIGHT_MAX", "30"
-))
+#
+# Removed: static LN/RMSNorm |weight|.max() cap. That defense was a gauge
+# artifact: under the RMSNorm·Linear scale invariance an attacker can absorb
+# any pumped norm gain into the next Linear's input columns and bypass the
+# cap with a functionally identical model. The grad-norm caps below are the
+# real defense; if a pumped-norm checkpoint actually destabilizes pretraining,
+# layer 2/3 catches it via the gradient explosion it would induce.
 
 # Global gradient L2 norm cap. A healthy ~1B-7B model gradient on a 256-token
 # random batch is typically O(1)–O(10); 500 is comfortably above honest
@@ -784,31 +778,23 @@ def _norm_modules(model):
     return [(n, m) for n, m in model.named_modules() if "Norm" in type(m).__name__]
 
 
-def _check_norm_weight_cap(model) -> tuple[bool, str | None, float]:
-    """Layer 1 — static LN/RMSNorm weight cap.
-
-    Returns (ok, reason, max_norm_weight_seen). Walks every *Norm module's
-    `.weight` and rejects if any element exceeds the cap or is non-finite.
+def _max_norm_weight(model) -> float:
+    """Diagnostic: largest |w| across every *Norm module's weight. Returns
+    NaN if any norm weight is non-finite. Not used as a gate — see the
+    design comment for why a static cap on norm weights is meaningless.
     """
     max_seen = 0.0
-    for mod_name, mod in _norm_modules(model):
+    for _mod_name, mod in _norm_modules(model):
         for pname, p in mod.named_parameters(recurse=False):
             if not pname.endswith("weight"):
                 continue
             with torch.no_grad():
                 w = float(p.detach().abs().max().item())
             if not math_isfinite(w):
-                return (False,
-                        f"norm_weight_non_finite:{mod_name}.{pname} |w|.max()={w}",
-                        max_seen)
+                return float("nan")
             if w > max_seen:
                 max_seen = w
-            if w > FINETUNE_NORM_WEIGHT_MAX:
-                return (False,
-                        (f"norm_weight_cap:{mod_name}.{pname} "
-                         f"|w|.max()={w:.3e} > {FINETUNE_NORM_WEIGHT_MAX:.1f}"),
-                        max_seen)
-    return True, None, max_seen
+    return max_seen
 
 
 def norm_quantization_score(model) -> float | None:
@@ -881,10 +867,9 @@ def _build_probe_verdict(*, ok, reason, status,
         "ok": ok,
         "status": status,
         "reason": reason,
-        # Layer 1.
+        # Diagnostic (no gating).
         "max_norm_weight": max_norm_weight,
-        "norm_weight_cap": FINETUNE_NORM_WEIGHT_MAX,
-        # Layers 2-4 (aggregate).
+        # Active gates (aggregate).
         "global_grad_norm": max_grad,
         "global_grad_norm_cap": FINETUNE_GRAD_NORM_MAX,
         "param_group_grad_norms": dict(agg_groups),
@@ -1025,16 +1010,9 @@ def trainability_probe(model) -> dict:
             f"(suspicious clustering of normalization-tensor norms)"
         )
 
-    # Layer 1 — static norm-weight cap (no compute).
-    ok1, reason1, max_norm_w = _check_norm_weight_cap(model)
-    if not ok1:
-        return _build_probe_verdict(
-            ok=False, reason=reason1, status="anti_finetune",
-            max_norm_weight=max_norm_w, per_seed=[],
-            norm_quant=norm_quant, warnings=warnings,
-        )
+    max_norm_w = _max_norm_weight(model)
 
-    # Layers 2-5: snapshot training state, run multi-seed probes, restore.
+    # Snapshot training state, run multi-seed probes, restore.
     saved_rg = {n: p.requires_grad for n, p in model.named_parameters()}
     was_training = model.training
 

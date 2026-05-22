@@ -37,7 +37,7 @@ from pathlib import Path
 
 import bittensor as bt
 
-from model_store import ModelRef, build_reveal_payload
+from model_store import DIGEST_RE, ModelRef, build_reveal_v3
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s [submit] %(message)s",
@@ -62,7 +62,14 @@ def main():
     args = ap.parse_args()
 
     v = json.loads(Path(args.verdict).read_text())
-    king_hash = v["king_hash"][:16]
+    # v3 requires the full king digest with format prefix, not a 16-char
+    # truncation. train_challenger.py must persist `king_digest` exactly as it
+    # appears on the dashboard (sha256:<64hex> or hf:<40hex>).
+    king_digest_full = v.get("king_digest") or v.get("king_hash")
+    if not king_digest_full or not DIGEST_RE.match(king_digest_full):
+        log.error("verdict missing valid `king_digest` (need sha256:<64hex> or hf:<40hex>); "
+                  "update train_challenger.py to write the full king digest from the dashboard")
+        sys.exit(7)
     repo = v.get("uploaded_repo") or v.get("model_repo")
     digest = v.get("uploaded_digest") or v.get("model_digest")
     if not repo or not digest:
@@ -78,7 +85,7 @@ def main():
                   v["best"]["mu_hat"], v["best"]["lcb"], v["best"]["delta"])
         sys.exit(3)
 
-    wallet = bt.wallet(name=args.wallet_name, hotkey=args.hotkey)
+    wallet = bt.Wallet(name=args.wallet_name, hotkey=args.hotkey)
     log.info("wallet hotkey: %s", wallet.hotkey.ss58_address)
 
     coldkey_ss58 = wallet.coldkeypub.ss58_address
@@ -102,14 +109,14 @@ def main():
     log.info("coldkey gate ok: repo '%s' contains coldkey prefix '%s'",
              repo, expected_prefix)
 
-    payload = build_reveal_payload(king_hash, model_ref)
+    payload = build_reveal_v3(king_digest_full, model_ref, wallet.hotkey.ss58_address)
     log.info("payload: %s", payload)
 
     if args.dry_run:
         log.info("[dry-run] not submitting")
         return
 
-    sub = bt.subtensor(network=args.network)
+    sub = bt.Subtensor(network=args.network)
     meta = sub.metagraph(args.netuid)
     if wallet.hotkey.ss58_address not in meta.hotkeys:
         log.error("hotkey not registered on netuid %d", args.netuid)
@@ -117,14 +124,15 @@ def main():
     uid = meta.hotkeys.index(wallet.hotkey.ss58_address)
     log.info("registered as uid=%d", uid)
 
-    ok, block = sub.set_reveal_commitment(
+    resp = sub.set_reveal_commitment(
         wallet=wallet, netuid=args.netuid,
         data=payload, blocks_until_reveal=args.blocks_until_reveal,
+        wait_for_revealed_execution=False,
     )
-    if ok:
-        log.info("reveal committed at block %d -- validator should pick up after reveal", block)
+    if resp.success:
+        log.info("reveal committed: %s -- validator should pick up after reveal", resp.message)
     else:
-        log.error("commitment failed")
+        log.error("commitment failed: %s", resp.message)
         sys.exit(5)
 
 

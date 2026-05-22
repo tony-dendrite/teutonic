@@ -11,33 +11,25 @@ from typing import Iterable
 from hippius_hub import snapshot_download, upload_folder
 
 
-REGISTRY_URL = os.environ.get("TEUTONIC_HIPPIUS_REGISTRY", "https://registry.hippius.com")
-HUB_URL = os.environ.get("TEUTONIC_HIPPIUS_HUB_URL", "https://hub.hippius.com")
 MODEL_CACHE_DIR = os.environ.get("TEUTONIC_MODEL_CACHE_DIR", "/tmp/teutonic/hippius_models")
 HUB_TOKEN = (
     os.environ.get("HIPPIUS_HUB_TOKEN")
-    or os.environ.get("HIPPIUS_TOKEN")
-    or os.environ.get("TEUTONIC_HIPPIUS_TOKEN")
-    or None
+    or (Path("~/.cache/hippius/hub/token").expanduser().read_text().strip()
+        if Path("~/.cache/hippius/hub/token").expanduser().exists() else None)
 )
 
-REVEAL_VERSION = "v2"
+REVEAL_V3_PREFIX = "v3"
 REPO_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._/-]*$")
-DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-LEGACY_HF_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
-LEGACY_MODEL_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+# Two digest shapes accepted:
+#   - "sha256:<64hex>"  Hippius OCI manifest digest (challenger uploads via
+#                       hippius_hub, also the canonical Hippius reference)
+#   - "hf:<40hex>"      HuggingFace commit SHA (genesis king pinned to a
+#                       vanilla HF repo without a Hippius mirror)
+DIGEST_RE = re.compile(r"^(sha256:[0-9a-f]{64}|hf:[0-9a-f]{40})$")
+SS58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$")
 
-ALLOW_PATTERNS = [
-    "*.safetensors",
-    "config.json",
-    "model.safetensors.index.json",
-    "tokenizer*",
-    "special_tokens*",
-    "generation_config.json",
-    "*.json",
-    "*.model",
-    "*.txt",
-]
+ALLOW_PATTERNS = ["*.safetensors", "*.json", "tokenizer*", "special_tokens*", "*.model", "*.txt"]
+CONFIG_ONLY_PATTERNS = ALLOW_PATTERNS[1:]
 
 
 @dataclass(frozen=True)
@@ -61,35 +53,38 @@ class ModelRef:
     def immutable_ref(self) -> str:
         return f"{self.repo}@{self.digest}"
 
-    @property
-    def hub_url(self) -> str:
-        return f"{HUB_URL.rstrip('/')}/{self.repo}@{self.digest}"
-
 
 def _normalise_digest(value: str) -> str:
     digest = (value or "").strip()
-    if LEGACY_MODEL_HASH_RE.match(digest):
-        digest = f"sha256:{digest}"
     if not DIGEST_RE.match(digest):
         raise ValueError(f"invalid OCI digest: {value!r}")
     return digest
 
 
-def build_reveal_payload(king_hash: str, ref: ModelRef) -> str:
-    king_prefix = (king_hash or "")[:16]
-    if not re.match(r"^[0-9a-fA-F]{4,16}$", king_prefix):
-        raise ValueError(f"invalid king hash prefix: {king_hash!r}")
-    return f"{REVEAL_VERSION}|{king_prefix.lower()}|{ref.repo}|{ref.digest}"
+# v3 payload: `v3|<king_digest>|<challenger_repo>|<challenger_digest>|<author_hotkey>`.
+# Digests carry their format prefix (sha256:/hf:) so the validator can dispatch
+# to the right snapshot path. author_hotkey is the 48-char ss58 of the
+# submitter, kept for cross-check against the chain-side iteration key (§4).
+# Longest case: `v3|sha256:<64>|<repo-50>|sha256:<64>|<ss58-48>` ≈ 220 chars.
+
+def build_reveal_v3(king_digest: str, challenger_ref: ModelRef, author_hotkey: str) -> str:
+    king = _normalise_digest(king_digest)
+    hk = (author_hotkey or "").strip()
+    if not SS58_RE.match(hk):
+        raise ValueError(f"invalid author hotkey ss58: {author_hotkey!r}")
+    return f"{REVEAL_V3_PREFIX}|{king}|{challenger_ref.repo}|{challenger_ref.digest}|{hk}"
 
 
-def parse_reveal_payload(data: str) -> tuple[str, ModelRef]:
-    parts = (data or "").strip().split("|")
-    if len(parts) != 4 or parts[0] != REVEAL_VERSION:
-        raise ValueError("expected v2|king_hash16|repo|sha256:digest reveal")
-    king_hash, repo, digest = parts[1], parts[2], _normalise_digest(parts[3])
-    if not re.match(r"^[0-9a-fA-F]{4,16}$", king_hash):
-        raise ValueError(f"invalid king hash prefix: {king_hash!r}")
-    return king_hash.lower(), ModelRef(repo, digest)
+def parse_reveal_v3(payload: str) -> tuple[str, ModelRef, str]:
+    """Returns (king_digest_with_prefix, ModelRef(challenger_repo, challenger_digest), author_hotkey)."""
+    parts = (payload or "").strip().split("|")
+    if len(parts) != 5 or parts[0] != REVEAL_V3_PREFIX:
+        raise ValueError("expected v3|king_digest|repo|challenger_digest|author_hotkey reveal")
+    king = _normalise_digest(parts[1])
+    hk = parts[4].strip()
+    if not SS58_RE.match(hk):
+        raise ValueError(f"invalid v3 author hotkey: {parts[4]!r}")
+    return king, ModelRef(parts[2], _normalise_digest(parts[3])), hk
 
 
 def _cache_snapshot_path(ref: ModelRef) -> Path:
@@ -105,52 +100,43 @@ def local_snapshot_path(ref: ModelRef) -> str:
     return str(path)
 
 
-def _call_snapshot_download(ref: ModelRef, local_dir: str | None, max_workers: int | None) -> str:
-    kwargs = {
-        "repo": ref.repo,
-        "repo_id": ref.repo,
-        "digest": ref.digest,
-        "revision": ref.digest,
-        "local_dir": local_dir,
-        "allow_patterns": ALLOW_PATTERNS,
-        "max_workers": max_workers,
-        "token": HUB_TOKEN,
-    }
-    candidates = [
-        ("repo", "digest", "local_dir", "allow_patterns", "max_workers", "token"),
-        ("repo_id", "digest", "local_dir", "allow_patterns", "max_workers", "token"),
-        ("repo", "revision", "local_dir", "allow_patterns", "max_workers", "token"),
-        ("repo_id", "revision", "local_dir", "allow_patterns", "max_workers", "token"),
-    ]
-    last_error: Exception | None = None
-    for names in candidates:
-        call_kwargs = {name: kwargs[name] for name in names if kwargs[name] is not None}
-        try:
-            return str(snapshot_download(**call_kwargs))
-        except TypeError as exc:
-            last_error = exc
-            continue
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("snapshot_download failed without an exception")
+def _call_snapshot_download(ref: ModelRef, local_dir: str | None, max_workers: int | None,
+                            *, allow_patterns=ALLOW_PATTERNS) -> str:
+    if ref.digest.startswith("hf:"):
+        from huggingface_hub import snapshot_download as hf_snapshot_download
+        return str(hf_snapshot_download(
+            repo_id=ref.repo, revision=ref.digest[3:], local_dir=local_dir,
+            allow_patterns=allow_patterns, max_workers=max_workers or 8,
+            token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY"),
+        ))
+    return str(snapshot_download(
+        repo_id=ref.repo, revision=ref.digest, local_dir=local_dir,
+        allow_patterns=allow_patterns, max_workers=max_workers or 8, token=HUB_TOKEN,
+    ))
 
 
-def materialize_model(ref: ModelRef, local_dir: str | None = None, max_workers: int | None = None) -> str:
-    """Download or reuse an immutable Hippius Hub snapshot."""
-    target = Path(local_dir) if local_dir else _cache_snapshot_path(ref)
-    if target.exists() and any(target.glob("*.safetensors")):
-        return str(target)
+def materialize_model(ref: ModelRef, local_dir: str | None = None, max_workers: int | None = None,
+                       *, config_only: bool = False) -> str:
+    """Download or reuse an immutable Hippius Hub snapshot.
+
+    `config_only=True` skips the large `*.safetensors` files — use for the
+    validator's per-challenger arch/lock validation which only needs config.json.
+    Cache dir is suffixed with `_cfg` so a config-only fetch doesn't pollute a
+    later full-fetch's cache state.
+    """
+    if config_only:
+        base = Path(local_dir) if local_dir else _cache_snapshot_path(ref)
+        target = base.with_name(base.name + "_cfg")
+    else:
+        target = Path(local_dir) if local_dir else _cache_snapshot_path(ref)
+    if target.exists() and (target / "config.json").exists():
+        if config_only or any(target.glob("*.safetensors")):
+            return str(target)
     if target.exists():
         shutil.rmtree(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    return _call_snapshot_download(ref, str(target), max_workers)
-
-
-def ensure_ref_exists(ref: ModelRef) -> bool:
-    snapshot = materialize_model(ref, max_workers=4)
-    if not list(Path(snapshot).glob("*.safetensors")):
-        raise FileNotFoundError(f"{ref.immutable_ref} has no .safetensors files")
-    return True
+    patterns = CONFIG_ONLY_PATTERNS if config_only else ALLOW_PATTERNS
+    return _call_snapshot_download(ref, str(target), max_workers, allow_patterns=patterns)
 
 
 def list_snapshot_files(snapshot: str | os.PathLike[str]) -> list[str]:
@@ -160,6 +146,25 @@ def list_snapshot_files(snapshot: str | os.PathLike[str]) -> list[str]:
         for p in root.rglob("*")
         if p.is_file()
     )
+
+
+def list_remote_files(ref: ModelRef) -> list[str]:
+    """Return the file list for a Hippius/HF ref without downloading content.
+
+    Reads OCI manifest layer titles for sha256: digests; queries the HF API
+    file tree for hf: digests. Use to gate on file presence (e.g. is
+    `*.safetensors` actually there) without paying the snapshot download
+    cost.
+    """
+    if ref.digest.startswith("hf:"):
+        from huggingface_hub import HfApi
+        api = HfApi(token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY"))
+        return sorted(api.list_repo_files(repo_id=ref.repo, revision=ref.digest[3:]))
+    from hippius_hub._oci import fetch_manifest, layer_titles
+    from hippius_hub.auth import get_oci_bearer_token, resolve_token_value
+    oci_token = get_oci_bearer_token(ref.repo, resolve_token_value(HUB_TOKEN), push=False)
+    manifest = fetch_manifest("https://registry.hippius.com", ref.repo, ref.digest, oci_token)
+    return sorted(layer_titles(manifest))
 
 
 def snapshot_size(snapshot: str | os.PathLike[str], files: Iterable[str] | None = None) -> int:
@@ -183,22 +188,6 @@ def sha256_safetensors(path: str | os.PathLike[str]) -> str:
     return h.hexdigest()
 
 
-def _extract_uploaded_digest(result) -> str:
-    if isinstance(result, ModelRef):
-        return result.digest
-    if isinstance(result, str):
-        return _normalise_digest(result)
-    if isinstance(result, dict):
-        for key in ("digest", "manifest_digest", "oci_digest", "uploaded_digest"):
-            if result.get(key):
-                return _normalise_digest(str(result[key]))
-    for key in ("digest", "manifest_digest", "oci_digest", "uploaded_digest"):
-        value = getattr(result, key, None)
-        if value:
-            return _normalise_digest(str(value))
-    raise ValueError(f"could not determine Hippius upload digest from {result!r}")
-
-
 def upload_model_folder(
     folder_path: str | os.PathLike[str],
     repo: str,
@@ -206,33 +195,8 @@ def upload_model_folder(
     commit_message: str | None = None,
 ) -> ModelRef:
     """Upload a model folder to Hippius Hub and return its immutable digest."""
-    folder = str(folder_path)
-    kwargs = {
-        "folder_path": folder,
-        "path": folder,
-        "repo": repo,
-        "repo_id": repo,
-        "tag": revision,
-        "revision": revision,
-        "commit_message": commit_message,
-        "allow_patterns": ALLOW_PATTERNS,
-        "token": HUB_TOKEN,
-    }
-    candidates = [
-        ("folder_path", "repo", "tag", "commit_message", "allow_patterns", "token"),
-        ("folder_path", "repo_id", "tag", "commit_message", "allow_patterns", "token"),
-        ("folder_path", "repo", "revision", "commit_message", "allow_patterns", "token"),
-        ("path", "repo", "tag", "commit_message", "allow_patterns", "token"),
-    ]
-    last_error: Exception | None = None
-    for names in candidates:
-        call_kwargs = {name: kwargs[name] for name in names if kwargs[name] is not None}
-        try:
-            result = upload_folder(**call_kwargs)
-            return ModelRef(repo, _extract_uploaded_digest(result))
-        except TypeError as exc:
-            last_error = exc
-            continue
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("upload_folder failed without an exception")
+    result = upload_folder(
+        repo_id=repo, folder_path=str(folder_path), revision=revision,
+        commit_message=commit_message, allow_patterns=ALLOW_PATTERNS, token=HUB_TOKEN,
+    )
+    return ModelRef(repo, _normalise_digest(str(result.oid)))

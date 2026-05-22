@@ -8,15 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from hippius_hub import snapshot_download, upload_folder
+from hippius_hub import login as hub_login, snapshot_download, upload_folder
 
 
 MODEL_CACHE_DIR = os.environ.get("TEUTONIC_MODEL_CACHE_DIR", "/tmp/teutonic/hippius_models")
-HUB_TOKEN = (
-    os.environ.get("HIPPIUS_HUB_TOKEN")
-    or (Path("~/.cache/hippius/hub/token").expanduser().read_text().strip()
-        if Path("~/.cache/hippius/hub/token").expanduser().exists() else None)
-)
+HUB_TOKEN_PATH = Path("~/.cache/hippius/hub/token").expanduser()
 
 REVEAL_V3_PREFIX = "v3"
 REVEAL_V4_PREFIX = "v4"
@@ -31,6 +27,114 @@ SS58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{47,48}$")
 
 ALLOW_PATTERNS = ["*.safetensors", "*.json", "tokenizer*", "special_tokens*", "*.model", "*.txt"]
 CONFIG_ONLY_PATTERNS = ALLOW_PATTERNS[1:]
+
+HUB_TOKEN_ENV_NAMES = (
+    "HIPPIUS_HUB_TOKEN",
+    "HIPPIUS_TOKEN",
+    "TEUTONIC_HIPPIUS_TOKEN",
+)
+S3_ONLY_ENV_NAMES = (
+    "HIPPIUS_ACCESS_KEY",
+    "HIPPIUS_SECRET_ACCESS_KEY",
+    "HIPPIUS_SECRET_KEY",
+    "HIPPIUS_ACCESS_KEY_ID",
+    "TEUTONIC_HIPPIUS_ACCESS_KEY",
+    "TEUTONIC_HIPPIUS_SECRET_KEY",
+)
+HUB_USERNAME_ENV_NAMES = (
+    "HIPPIUS_HUB_USERNAME",
+    "HIPPIUS_REGISTRY_USERNAME",
+    "TEUTONIC_HIPPIUS_USERNAME",
+)
+HUB_PASSWORD_ENV_NAMES = (
+    "HIPPIUS_HUB_PASSWORD",
+    "HIPPIUS_REGISTRY_PASSWORD",
+    "TEUTONIC_HIPPIUS_PASSWORD",
+)
+
+
+class HippiusHubAuthError(RuntimeError):
+    """Raised when Hub/registry auth is unavailable or clearly misconfigured."""
+
+
+def _get_first_env(names: tuple[str, ...]) -> str | None:
+    for name in names:
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def get_hub_token() -> str | None:
+    token = _get_first_env(HUB_TOKEN_ENV_NAMES)
+    if token:
+        return token
+    if HUB_TOKEN_PATH.exists():
+        cached = HUB_TOKEN_PATH.read_text().strip()
+        if cached:
+            return cached
+    return None
+
+
+def get_hub_basic_auth() -> tuple[str, str] | None:
+    username = _get_first_env(HUB_USERNAME_ENV_NAMES)
+    password = _get_first_env(HUB_PASSWORD_ENV_NAMES)
+    if username and password:
+        return username, password
+    return None
+
+
+def _s3_auth_detail() -> str:
+    present_s3_names = [name for name in S3_ONLY_ENV_NAMES if (os.environ.get(name) or "").strip()]
+    if not present_s3_names:
+        return ""
+    return (
+        " Found only S3-style Hippius credentials "
+        f"({', '.join(present_s3_names)}), which are not valid for Hub/OCI registry auth."
+    )
+
+
+def _resolve_hub_token(action: str | None = None) -> str | None:
+    token = get_hub_token()
+    if token:
+        return token
+
+    basic_auth = get_hub_basic_auth()
+    if basic_auth:
+        username, password = basic_auth
+        hub_login(username=username, password=password)
+        token = get_hub_token()
+        if token:
+            return token
+        if action:
+            raise HippiusHubAuthError(f"{action} could not read cached Hippius Hub auth after login.")
+        return None
+
+    if action:
+        raise HippiusHubAuthError(
+            f"{action} requires Hippius Hub auth via token {HUB_TOKEN_ENV_NAMES} "
+            f"or username/password envs {HUB_USERNAME_ENV_NAMES} + {HUB_PASSWORD_ENV_NAMES}."
+            f"{_s3_auth_detail()}"
+        )
+    return None
+
+
+def _prepare_upload_token(action: str) -> str | None:
+    basic_auth = get_hub_basic_auth()
+    if basic_auth:
+        username, password = basic_auth
+        hub_login(username=username, password=password)
+        return None
+
+    token = get_hub_token()
+    if token:
+        return token
+
+    raise HippiusHubAuthError(
+        f"{action} requires Hippius Hub auth via token {HUB_TOKEN_ENV_NAMES} "
+        f"or username/password envs {HUB_USERNAME_ENV_NAMES} + {HUB_PASSWORD_ENV_NAMES}."
+        f"{_s3_auth_detail()}"
+    )
 
 
 @dataclass(frozen=True)
@@ -133,7 +237,8 @@ def _call_snapshot_download(ref: ModelRef, local_dir: str | None, max_workers: i
         ))
     return str(snapshot_download(
         repo_id=ref.repo, revision=ref.digest, local_dir=local_dir,
-        allow_patterns=allow_patterns, max_workers=max_workers or 8, token=HUB_TOKEN,
+        allow_patterns=allow_patterns, max_workers=max_workers or 8,
+        token=_resolve_hub_token(f"Downloading {ref.immutable_ref}"),
     ))
 
 
@@ -184,7 +289,8 @@ def list_remote_files(ref: ModelRef) -> list[str]:
         return sorted(api.list_repo_files(repo_id=ref.repo, revision=ref.digest[3:]))
     from hippius_hub._oci import fetch_manifest, layer_titles
     from hippius_hub.auth import get_oci_bearer_token, resolve_token_value
-    oci_token = get_oci_bearer_token(ref.repo, resolve_token_value(HUB_TOKEN), push=False)
+    token = _resolve_hub_token(f"Listing remote files for {ref.immutable_ref}")
+    oci_token = get_oci_bearer_token(ref.repo, resolve_token_value(token), push=False)
     manifest = fetch_manifest("https://registry.hippius.com", ref.repo, ref.digest, oci_token)
     return sorted(layer_titles(manifest))
 
@@ -217,8 +323,9 @@ def upload_model_folder(
     commit_message: str | None = None,
 ) -> ModelRef:
     """Upload a model folder to Hippius Hub and return its immutable digest."""
+    token = _prepare_upload_token(f"Uploading {folder_path} to {repo}")
     result = upload_folder(
         repo_id=repo, folder_path=str(folder_path), revision=revision,
-        commit_message=commit_message, allow_patterns=ALLOW_PATTERNS, token=HUB_TOKEN,
+        commit_message=commit_message, allow_patterns=ALLOW_PATTERNS, token=token,
     )
     return ModelRef(repo, _normalise_digest(str(result.oid)))

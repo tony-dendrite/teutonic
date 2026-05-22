@@ -3,7 +3,7 @@
 
 Downloads the current king, produces a challenger by perturbing every float
 tensor with low-amplitude Gaussian noise, uploads to Hippius Hub, and posts a
-v3 reveal commitment binding (king_digest, challenger_repo, challenger_digest).
+v4 reveal commitment binding (challenger_repo, challenger_digest).
 
 Noise perturbation will not clear `delta` on a mature king — it is a pipeline
 test stub, not a strategy. Real dethrones come from real fine-tuning (LoRA,
@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import chain_config  # noqa: E402
 from model_store import (  # noqa: E402
     ModelRef,
-    build_reveal_v3,
+    build_reveal_v4,
     materialize_model,
     upload_model_folder,
 )
@@ -214,10 +214,9 @@ def main():
     )
     log.info("uploaded to %s", challenger_ref.immutable_ref)
 
-    # On-chain reveal: v3|king_digest|repo|challenger_digest|author_hotkey.
-    # Digests carry their format prefix (sha256:/hf:); king_digest is pulled
-    # straight from the dashboard, challenger_digest from the upload.
-    payload = build_reveal_v3(king_digest, challenger_ref, my_hotkey)
+    # On-chain reveal: v4|repo|challenger_digest|author_hotkey.
+    # challenger_digest carries its format prefix (sha256:/hf:).
+    payload = build_reveal_v4(challenger_ref, my_hotkey)
     log.info("submitting reveal: %s", payload)
 
     resp = subtensor.set_reveal_commitment(

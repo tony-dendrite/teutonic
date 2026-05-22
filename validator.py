@@ -40,6 +40,7 @@ from model_store import (  # noqa: E402
     list_remote_files,
     list_snapshot_files,
     materialize_model,
+    parse_reveal_v4,
     parse_reveal_v3,
     snapshot_size,
 )
@@ -547,12 +548,10 @@ def _decode_commitment_pair(pair):
 
 
 def scan_reveals(subtensor, netuid, completed_repos, seen_hotkeys):
-    """Pull v3 reveals; return latest per hotkey not previously enqueued.
+    """Pull v4 reveals; return latest per hotkey not previously enqueued.
 
-    v3 format: `v3|<king_digest>|<challenger_repo>|<challenger_digest>` (see
-    model_store.parse_reveal_v3). The embedded king_digest is *not* enforced
-    here — the king may rotate between scan and process_challenge, so the
-    check belongs there (§4 stale-parent enforcement).
+    v4 format: `v4|<challenger_repo>|<challenger_digest>|<author_hotkey>`.
+    Any legacy reveal that still embeds a king digest is dropped at intake.
 
     Per-pair decode via _decode_commitment_pair instead of bittensor's
     `decode_revealed_commitment_with_hotkey`, which (a) raises on any single
@@ -584,21 +583,27 @@ def scan_reveals(subtensor, netuid, completed_repos, seen_hotkeys):
             continue
         block, data = max(entries, key=lambda e: e[0])
         try:
-            king_digest, ref, author_hotkey = parse_reveal_v3(data)
+            ref, author_hotkey = parse_reveal_v4(data)
         except ValueError:
+            try:
+                legacy_king_digest, _legacy_ref, _legacy_author_hotkey = parse_reveal_v3(data)
+            except ValueError:
+                continue
+            log.warning("dropping legacy king-bound reveal from %s at block %s "
+                        "(king_digest=%s); resubmit as v4 without king binding",
+                        hotkey[:16], block, legacy_king_digest[:19])
             continue
         if author_hotkey != hotkey:
             # Chain side is the source of truth (commit-reveal keys reveals by
             # signer). Payload mismatch means the miner stuffed the wrong ss58
             # in their reveal — log and trust the chain key.
-            log.warning("v3 author_hotkey %s mismatches chain key %s; trusting chain",
+            log.warning("v4 author_hotkey %s mismatches chain key %s; trusting chain",
                         author_hotkey[:16], hotkey[:16])
         if ref.immutable_ref in completed_repos:
             continue
         new.append({
             "hotkey": hotkey,
             "block": block,
-            "king_digest_at_reveal": king_digest,
             "model_repo": ref.repo,
             "model_digest": ref.digest,
         })
@@ -1275,24 +1280,16 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         log.info("skipping %s: repo %s already evaluated this cycle", cid, model_repo)
         return
 
-    # §4 stale-parent: enforced at process time because the king may rotate
-    # between scan_reveals and here. A challenger trained against king K1
-    # who arrives after the K2 coronation is dropped — they raced and lost,
-    # not the miner's fault but also not a real challenger to the current king.
-    # Both digests carry their format prefix (sha256:/hf:); comparing the
-    # canonicalised (strip+lower) forms matches format AND value because the
-    # two prefixes are disjoint.
-    reveal_canon = (entry.get("king_digest_at_reveal") or "").strip().lower()
-    current_canon = (state.king.get("king_digest") or "").strip().lower()
-    if reveal_canon:
-        if reveal_canon != current_canon:
-            log.warning("stale_parent: %s committed against king %s, current is %s",
-                        cid, reveal_canon, current_canon)
-            state.failed_repos.add(model_key)
-            state.record_failure(entry, "stale_parent",
-                                  f"reveal pinned king {reveal_canon}, "
-                                  f"current king is {current_canon}")
-            return
+    # Any queued entry that still carries a king digest predates the v4 fork.
+    # Drop it rather than evaluating a payload shape we no longer accept.
+    legacy_king_digest = (entry.get("king_digest_at_reveal") or "").strip()
+    if legacy_king_digest:
+        log.warning("rejecting %s: legacy reveal pinned king %s", cid, legacy_king_digest[:19])
+        state.failed_repos.add(model_key)
+        state.record_failure(entry, "legacy_reveal_version",
+                              "submission included king_digest; resubmit as "
+                              "v4|repo|challenger_digest|author_hotkey")
+        return
 
     expected_ck_prefix = state.expected_coldkey_prefix(hotkey)
     if expected_ck_prefix:
@@ -1316,7 +1313,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         log.info("%s: coldkey for %s not in metagraph yet, skipping coldkey check",
                  cid, hotkey[:16])
 
-    _ = check_stale  # parameter retained for back-compat; stale-parent is enforced above per §4
+    _ = check_stale  # parameter retained for back-compat; v4 removed stale-parent binding
 
     # Pin to the OCI digest that the miner committed on-chain. Every reveal
     # entry MUST have a `model_digest` field; `scan_reveals` rejects everything

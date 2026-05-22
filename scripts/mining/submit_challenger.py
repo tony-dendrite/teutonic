@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Submit a pre-built challenger to the chain.
 
-Reads a verdict.json produced by train_challenger.py (king_hash,
-uploaded_repo, uploaded_digest) and posts the bittensor reveal commitment
-in the form `v2|{king_hash[:16]}|{repo}|sha256:{manifest_digest}`.
+Reads a verdict.json produced by train_challenger.py (uploaded_repo,
+uploaded_digest) and posts the bittensor reveal commitment in the form
+`v4|{repo}|sha256:{manifest_digest}|{author_hotkey}`.
 
 The OCI manifest digest is the immutable commitment to the file tree.
 
@@ -37,7 +37,7 @@ from pathlib import Path
 
 import bittensor as bt
 
-from model_store import DIGEST_RE, ModelRef, build_reveal_v3
+from model_store import ModelRef, build_reveal_v4
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s [submit] %(message)s",
@@ -62,14 +62,6 @@ def main():
     args = ap.parse_args()
 
     v = json.loads(Path(args.verdict).read_text())
-    # v3 requires the full king digest with format prefix, not a 16-char
-    # truncation. train_challenger.py must persist `king_digest` exactly as it
-    # appears on the dashboard (sha256:<64hex> or hf:<40hex>).
-    king_digest_full = v.get("king_digest") or v.get("king_hash")
-    if not king_digest_full or not DIGEST_RE.match(king_digest_full):
-        log.error("verdict missing valid `king_digest` (need sha256:<64hex> or hf:<40hex>); "
-                  "update train_challenger.py to write the full king digest from the dashboard")
-        sys.exit(7)
     repo = v.get("uploaded_repo") or v.get("model_repo")
     digest = v.get("uploaded_digest") or v.get("model_digest")
     if not repo or not digest:
@@ -109,7 +101,7 @@ def main():
     log.info("coldkey gate ok: repo '%s' contains coldkey prefix '%s'",
              repo, expected_prefix)
 
-    payload = build_reveal_v3(king_digest_full, model_ref, wallet.hotkey.ss58_address)
+    payload = build_reveal_v4(model_ref, wallet.hotkey.ss58_address)
     log.info("payload: %s", payload)
 
     if args.dry_run:

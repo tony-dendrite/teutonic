@@ -10,7 +10,7 @@ What it does:
   2. patches config.json fields that need to match the king's arch lock
   3. validates the patched config matches the king
   4. uploads to Hippius Hub under the operator's namespace
-  5. forms a v3 reveal commitment and submits it on chain
+  5. forms a v4 reveal commitment and submits it on chain
 
 Coldkey-prefix gate: the validator REJECTS any Hippius repo whose name does
 NOT contain the first 8 ss58 chars of the miner's coldkey. The repo name
@@ -45,7 +45,7 @@ import chain_config  # noqa: E402
 from model_store import (  # noqa: E402
     DIGEST_RE,
     ModelRef,
-    build_reveal_v3,
+    build_reveal_v4,
     upload_model_folder,
 )
 
@@ -247,9 +247,9 @@ def main():
         log.error("upload returned invalid digest: %r", ref.digest)
         sys.exit(4)
 
-    # Form v3 reveal.
-    payload = build_reveal_v3(king_digest, ref, hk_ss58)
-    log.info("v3 reveal payload (%d chars): %s", len(payload), payload)
+    # Form v4 reveal.
+    payload = build_reveal_v4(ref, hk_ss58)
+    log.info("v4 reveal payload (%d chars): %s", len(payload), payload)
 
     if args.dry_run:
         log.info("[dry-run] not submitting on chain. Run again without --dry-run "

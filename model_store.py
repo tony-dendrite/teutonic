@@ -19,6 +19,7 @@ HUB_TOKEN = (
 )
 
 REVEAL_V3_PREFIX = "v3"
+REVEAL_V4_PREFIX = "v4"
 REPO_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*/[a-zA-Z0-9][a-zA-Z0-9._/-]*$")
 # Two digest shapes accepted:
 #   - "sha256:<64hex>"  Hippius OCI manifest digest (challenger uploads via
@@ -61,11 +62,32 @@ def _normalise_digest(value: str) -> str:
     return digest
 
 
-# v3 payload: `v3|<king_digest>|<challenger_repo>|<challenger_digest>|<author_hotkey>`.
-# Digests carry their format prefix (sha256:/hf:) so the validator can dispatch
-# to the right snapshot path. author_hotkey is the 48-char ss58 of the
-# submitter, kept for cross-check against the chain-side iteration key (§4).
-# Longest case: `v3|sha256:<64>|<repo-50>|sha256:<64>|<ss58-48>` ≈ 220 chars.
+# v4 payload: `v4|<challenger_repo>|<challenger_digest>|<author_hotkey>`.
+# challenger_digest carries its format prefix (sha256:/hf:) so the validator
+# can dispatch to the right snapshot path. author_hotkey is the 48-char ss58
+# of the submitter, kept for cross-check against the chain-side iteration key.
+# Longest case: `v4|<repo-50>|sha256:<64>|<ss58-48>` ≈ 160 chars.
+
+def build_reveal_v4(challenger_ref: ModelRef, author_hotkey: str) -> str:
+    hk = (author_hotkey or "").strip()
+    if not SS58_RE.match(hk):
+        raise ValueError(f"invalid author hotkey ss58: {author_hotkey!r}")
+    return f"{REVEAL_V4_PREFIX}|{challenger_ref.repo}|{challenger_ref.digest}|{hk}"
+
+
+def parse_reveal_v4(payload: str) -> tuple[ModelRef, str]:
+    """Returns (ModelRef(challenger_repo, challenger_digest), author_hotkey)."""
+    parts = (payload or "").strip().split("|")
+    if len(parts) != 4 or parts[0] != REVEAL_V4_PREFIX:
+        raise ValueError("expected v4|repo|challenger_digest|author_hotkey reveal")
+    hk = parts[3].strip()
+    if not SS58_RE.match(hk):
+        raise ValueError(f"invalid v4 author hotkey: {parts[3]!r}")
+    return ModelRef(parts[1], _normalise_digest(parts[2])), hk
+
+
+# Legacy v3 payload: `v3|<king_digest>|<challenger_repo>|<challenger_digest>|<author_hotkey>`.
+# Kept only so the validator can identify and drop stale pre-v4 submissions.
 
 def build_reveal_v3(king_digest: str, challenger_ref: ModelRef, author_hotkey: str) -> str:
     king = _normalise_digest(king_digest)

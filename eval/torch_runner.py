@@ -46,6 +46,7 @@ import boto3
 import numpy as np
 import torch
 import torch.nn.functional as F
+from botocore import UNSIGNED
 from botocore.config import Config as BotoConfig
 from collections import defaultdict
 from transformers import AutoModelForCausalLM
@@ -77,13 +78,17 @@ class R2:
         # Hippius can be slow on large ranged reads — 5min read_timeout
         # avoids spurious "Read timeout on endpoint URL: None" failures.
         _pool = max(SHARD_DL_WORKERS * 2, 32)
+        r2_access = os.environ.get("TEUTONIC_R2_ACCESS_KEY")
+        r2_secret = os.environ.get("TEUTONIC_R2_SECRET_KEY")
+        r2_unsigned = not (r2_access and r2_secret)
         self.client = boto3.client(
             "s3",
             endpoint_url=os.environ["TEUTONIC_R2_ENDPOINT"],
-            aws_access_key_id=os.environ["TEUTONIC_R2_ACCESS_KEY"],
-            aws_secret_access_key=os.environ["TEUTONIC_R2_SECRET_KEY"],
+            aws_access_key_id=r2_access,
+            aws_secret_access_key=r2_secret,
             region_name="auto",
             config=BotoConfig(
+                signature_version=UNSIGNED if r2_unsigned else "s3v4",
                 retries={"max_attempts": 5, "mode": "adaptive"},
                 max_pool_connections=_pool,
                 connect_timeout=30,
@@ -95,7 +100,8 @@ class R2:
         ds_endpoint = os.environ.get("TEUTONIC_DS_ENDPOINT")
         ds_access = os.environ.get("TEUTONIC_DS_ACCESS_KEY")
         ds_secret = os.environ.get("TEUTONIC_DS_SECRET_KEY")
-        if ds_endpoint and ds_access and ds_secret:
+        if ds_endpoint:
+            ds_unsigned = not (ds_access and ds_secret)
             self.ds_client = boto3.client(
                 "s3",
                 endpoint_url=ds_endpoint,
@@ -103,7 +109,7 @@ class R2:
                 aws_secret_access_key=ds_secret,
                 region_name="decentralized",
                 config=BotoConfig(
-                    signature_version="s3v4",
+                    signature_version=UNSIGNED if ds_unsigned else "s3v4",
                     retries={"max_attempts": 5, "mode": "adaptive"},
                     s3={"addressing_style": "path"},
                     max_pool_connections=_pool,
@@ -1421,6 +1427,10 @@ def sample_public_holdout(r2, shard_key, public_seed: bytes,
         if len(raw_sequences) < n_public:
             log.warning("public holdout undersized: got %d, requested %d",
                         len(raw_sequences), n_public)
+        if vocab_size is not None and raw_sequences:
+            max_id = max(max(seq) for seq in raw_sequences if seq)
+            if max_id >= vocab_size:
+                raise ValueError(f"dataset token id {max_id} exceeds model vocab_size {vocab_size}")
         # Bind the digest to the set of source files actually used + the seed.
         # An auditor with the same manifest + seed reproduces the same files
         # and therefore the same digest. File-bytes shifts on the upstream

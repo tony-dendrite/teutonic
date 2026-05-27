@@ -37,6 +37,8 @@ def _endpoint_parts(endpoint_url: str) -> tuple[str, bool]:
 
 def _boto3_credentials(client) -> tuple[str, str, str | None]:
     creds = client._request_signer._credentials
+    if creds is None:
+        raise ValueError("boto3 client has no credentials")
     return creds.access_key, creds.secret_key, getattr(creds, "token", None)
 
 
@@ -82,6 +84,9 @@ def safe_upload_file(client, filename: str, bucket: str, key: str) -> None:
 def safe_download_file(client, bucket: str, key: str, filename: str) -> None:
     endpoint_url = getattr(getattr(client, "meta", None), "endpoint_url", None)
     if is_hippius_endpoint(endpoint_url):
-        _minio_client_from_boto3(client).fget_object(bucket, key, filename)
+        try:
+            _minio_client_from_boto3(client).fget_object(bucket, key, filename)
+        except ValueError:
+            client.download_file(bucket, key, filename)
         return
     client.download_file(bucket, key, filename)

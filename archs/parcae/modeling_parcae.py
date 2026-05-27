@@ -58,6 +58,7 @@ class ParcaeModel(ParcaePreTrainedModel):
 
 class ParcaeForCausalLM(ParcaePreTrainedModel):
     _tied_weights_keys = [r"lm_head\.weight$"]
+    all_tied_weights_keys = {}
 
     def __init__(self, config: ParcaeConfig):
         super().__init__(config)

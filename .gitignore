@@ -38,6 +38,7 @@ node_modules/
 
 # Local working state (operator-only, never push)
 .backups/
+.artifacts/
 memory/
 recent-chat.json
 teutonic_test/

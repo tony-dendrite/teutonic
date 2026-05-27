@@ -1,0 +1,27 @@
+[chain]
+name = "Teutonic-Parcae-1.3B"
+seed_repo = "teutonic/teutonic-parcae-1_3b-genesis"
+
+[arch]
+module = "archs.parcae"
+extra_lock_keys = [
+  "injection_type",
+  "n_layers_in_prelude",
+  "n_layers_in_recurrent_block",
+  "n_layers_in_coda",
+  "mean_recurrence",
+  "mean_backprop_depth",
+  "recurrent_embedding_dimension",
+  "recurrent_intermediation_embedding_dimension",
+  "prelude_norm",
+  "qk_norm",
+  "state_init",
+  "recurrent_iteration_method",
+  "sampling_scheme",
+]
+
+[seed]
+tokenizer_repo = "SandyResearch/parcae-tokenizer"
+repo_backend = "hippius"
+# Replace after `python -m archs.parcae.seed --push` prints the immutable repo digest.
+seed_digest = "sha256:<replace-with-uploaded-genesis-digest>"

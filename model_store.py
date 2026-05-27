@@ -8,9 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from hippius_hub import login as hub_login, snapshot_download, upload_folder
-
-
 MODEL_CACHE_DIR = os.environ.get("TEUTONIC_MODEL_CACHE_DIR", "/tmp/teutonic/hippius_models")
 HUB_TOKEN_PATH = Path("~/.cache/hippius/hub/token").expanduser()
 
@@ -55,6 +52,12 @@ HUB_PASSWORD_ENV_NAMES = (
 
 class HippiusHubAuthError(RuntimeError):
     """Raised when Hub/registry auth is unavailable or clearly misconfigured."""
+
+
+def _import_hippius_hub():
+    from hippius_hub import login as hub_login, snapshot_download, upload_folder
+
+    return hub_login, snapshot_download, upload_folder
 
 
 def _get_first_env(names: tuple[str, ...]) -> str | None:
@@ -102,6 +105,7 @@ def _resolve_hub_token(action: str | None = None) -> str | None:
     basic_auth = get_hub_basic_auth()
     if basic_auth:
         username, password = basic_auth
+        hub_login, _, _ = _import_hippius_hub()
         hub_login(username=username, password=password)
         token = get_hub_token()
         if token:
@@ -123,6 +127,7 @@ def _prepare_upload_token(action: str) -> str | None:
     basic_auth = get_hub_basic_auth()
     if basic_auth:
         username, password = basic_auth
+        hub_login, _, _ = _import_hippius_hub()
         hub_login(username=username, password=password)
         return None
 
@@ -235,6 +240,7 @@ def _call_snapshot_download(ref: ModelRef, local_dir: str | None, max_workers: i
             allow_patterns=allow_patterns, max_workers=max_workers or 8,
             token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_KEY"),
         ))
+    _, snapshot_download, _ = _import_hippius_hub()
     return str(snapshot_download(
         repo_id=ref.repo, revision=ref.digest, local_dir=local_dir,
         allow_patterns=allow_patterns, max_workers=max_workers or 8,
@@ -324,6 +330,7 @@ def upload_model_folder(
 ) -> ModelRef:
     """Upload a model folder to Hippius Hub and return its immutable digest."""
     token = _prepare_upload_token(f"Uploading {folder_path} to {repo}")
+    _, _, upload_folder = _import_hippius_hub()
     result = upload_folder(
         repo_id=repo, folder_path=str(folder_path), revision=revision,
         commit_message=commit_message, allow_patterns=ALLOW_PATTERNS, token=token,

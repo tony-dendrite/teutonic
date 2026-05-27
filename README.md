@@ -17,10 +17,12 @@ architecture module `archs.qwen3`, and tokenizer `Qwen/Qwen3-8B`. See
 [`docs/MINING.md`](docs/MINING.md) for the live mining contract and
 [`docs/DESIGN.md`](docs/DESIGN.md) for the current end-to-end flow.
 
-An experimental `Parcae-1.3B` integration is also staged locally via
+An experimental Parcae integration is also staged locally via
 [`archs/parcae/`](archs/parcae/), [`chain.parcae.toml`](chain.parcae.toml), and
-[`docs/PARCAE_1_3B.md`](docs/PARCAE_1_3B.md). It is ready for local scoring,
-but not promoted to the live chain until a real uploaded genesis digest exists.
+[`docs/PARCAE_1_3B.md`](docs/PARCAE_1_3B.md). The staged chain template is
+`1.3B`, and the same local conversion/eval path has been verified against the
+published `370M` checkpoint as well. It is ready for local scoring, but not
+promoted to the live chain until a real uploaded genesis digest exists.
 
 ## Repo layout
 

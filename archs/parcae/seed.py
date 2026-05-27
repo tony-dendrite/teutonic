@@ -1,4 +1,4 @@
-"""Convert the published Parcae 1.3B checkpoint into a Teutonic-safe seed repo."""
+"""Convert a published Parcae checkpoint into a Teutonic-safe seed repo."""
 
 from __future__ import annotations
 

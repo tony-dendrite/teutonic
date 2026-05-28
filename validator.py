@@ -85,6 +85,17 @@ SEED_DIGEST = os.environ.get("TEUTONIC_SEED_DIGEST", getattr(chain_config, "SEED
 FORCE_SEED_KING = False
 EVAL_SERVER_URL = os.environ.get("TEUTONIC_EVAL_SERVER", "http://localhost:9000")
 EVAL_DATASET_MODE = os.environ.get("TEUTONIC_EVAL_DATASET_MODE", "")
+PRETOKENIZED_DATASET_MANIFEST = os.environ.get(
+    "TEUTONIC_PRETOKENIZED_DATASET_MANIFEST", "dataset/v4/manifest.json"
+)
+PRETOKENIZED_DATASET_FALLBACKS = tuple(
+    key.strip()
+    for key in os.environ.get(
+        "TEUTONIC_PRETOKENIZED_DATASET_FALLBACKS",
+        "dataset/v2/manifest.json,dataset/v1/manifest.json",
+    ).split(",")
+    if key.strip()
+)
 WALLET_NAME = os.environ.get("BT_WALLET_NAME", "teutonic")
 WALLET_HOTKEY = os.environ.get("BT_WALLET_HOTKEY", "default")
 
@@ -124,6 +135,17 @@ COLDKEY_PREFIX_LEN = int(os.environ.get("TEUTONIC_COLDKEY_PREFIX_LEN", "8"))
 TMC_BASE = "https://api.taomarketcap.com/public/v1"
 
 log = logging.getLogger("teutonic")
+
+
+def _fetch_pretokenized_manifest(r2):
+    keys = (PRETOKENIZED_DATASET_MANIFEST,) + PRETOKENIZED_DATASET_FALLBACKS
+    for key in keys:
+        manifest = r2.ds_get(key)
+        if not manifest and key.startswith("dataset/"):
+            manifest = r2.get(key)
+        if manifest:
+            return manifest, key
+    return None, None
 
 
 class _EvalInnerError(Exception):
@@ -1486,11 +1508,10 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     else:
         state.set_phase("dataset_manifest", challenge_id=cid, notes="fetching dataset manifest")
         manifest = None
+        manifest_key = None
         manifest_attempts = 4
         for attempt in range(manifest_attempts):
-            manifest = r2.ds_get("dataset/v2/manifest.json")
-            if not manifest:
-                manifest = r2.get("dataset/v1/manifest.json")
+            manifest, manifest_key = _fetch_pretokenized_manifest(r2)
             if manifest:
                 break
             if attempt < manifest_attempts - 1:
@@ -1504,6 +1525,11 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
             state.queue.insert(0, entry)
             state.flush()
             return
+        state.set_phase(
+            "dataset_manifest_ready",
+            challenge_id=cid,
+            notes=f"using {manifest_key}",
+        )
         n_shards = manifest["total_shards"]
         seed_mat = f"{block_hash}:{hotkey}".encode()
         shard_idx = int.from_bytes(hashlib.blake2b(seed_mat, digest_size=8).digest(), "little") % n_shards

@@ -67,6 +67,18 @@ from model_store import ModelRef, materialize_model  # noqa: E402
 
 log = logging.getLogger("eval_torch")
 
+PRETOKENIZED_DATASET_MANIFEST = os.environ.get(
+    "TEUTONIC_PRETOKENIZED_DATASET_MANIFEST", "dataset/v4/manifest.json"
+)
+PRETOKENIZED_DATASET_FALLBACKS = tuple(
+    key.strip()
+    for key in os.environ.get(
+        "TEUTONIC_PRETOKENIZED_DATASET_FALLBACKS",
+        "dataset/v2/manifest.json,dataset/v1/manifest.json",
+    ).split(",")
+    if key.strip()
+)
+
 
 # ---------------------------------------------------------------------------
 # R2 client
@@ -176,6 +188,17 @@ def get_shard_info(r2, shard_key):
     for s in hdr["shape"]:
         n *= s
     return n
+
+
+def fetch_pretokenized_manifest(r2):
+    keys = (PRETOKENIZED_DATASET_MANIFEST,) + PRETOKENIZED_DATASET_FALLBACKS
+    for key in keys:
+        manifest = r2.ds_get(key)
+        if not manifest and key.startswith("dataset/"):
+            manifest = r2.get(key)
+        if manifest:
+            return manifest, key
+    return None, None
 
 
 R2_FETCH_WORKERS = 32
@@ -565,6 +588,66 @@ def _build_sharded_device_map(gpu_ids: list[int],
     return max_memory
 
 
+def _maybe_raw_local_parcae_config(repo: str) -> dict[str, object] | None:
+    if not os.path.isdir(repo):
+        return None
+    cfg_path = os.path.join(repo, "config.json")
+    if not os.path.isfile(cfg_path):
+        return None
+    try:
+        data = json.loads(pathlib.Path(cfg_path).read_text())
+    except Exception:
+        return None
+    if data.get("model_type") == "parcae":
+        return None
+    looks_like_parcae = (
+        str(data.get("name", "")).startswith("parcae-")
+        and "n_embd" in data
+        and "n_layers_in_prelude" in data
+        and "n_layers_in_recurrent_block" in data
+        and "n_layers_in_coda" in data
+    )
+    return data if looks_like_parcae else None
+
+
+def _load_raw_local_parcae_model(repo: str, device: str | None):
+    from safetensors.torch import load_file as load_safetensors
+
+    from archs.parcae.configuration_parcae import ParcaeConfig
+    from archs.parcae.modeling_parcae import ParcaeForCausalLM
+
+    raw_cfg = _maybe_raw_local_parcae_config(repo)
+    if raw_cfg is None:
+        raise RuntimeError(f"not a raw local Parcae repo: {repo}")
+
+    model = ParcaeForCausalLM(ParcaeConfig.from_parcae_config_dict(raw_cfg))
+
+    safetensors_path = os.path.join(repo, "model.safetensors")
+    bin_path = os.path.join(repo, "pytorch_model.bin")
+    if os.path.isfile(safetensors_path):
+        raw_state = load_safetensors(safetensors_path, device="cpu")
+    elif os.path.isfile(bin_path):
+        raw_state = torch.load(bin_path, map_location="cpu", weights_only=True)
+    else:
+        raise FileNotFoundError(f"no raw Parcae weights found under {repo}")
+
+    missing, unexpected = model.model.backbone.load_state_dict(raw_state, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            "raw local Parcae checkpoint mismatch; "
+            f"missing={missing[:5]} unexpected={unexpected[:5]}"
+        )
+
+    target_dtype = torch.float32
+    if device and str(device).startswith("cuda"):
+        target_dtype = torch.bfloat16
+    if device is not None:
+        model = model.to(device=device, dtype=target_dtype)
+    else:
+        model = model.to(dtype=target_dtype)
+    return model
+
+
 def load_model(repo, device, label="model", force_download=False, revision=None,
                shard_across_gpus: list[int] | None = None):
     """Load a model, either onto a single GPU (legacy) or sharded across a
@@ -592,7 +675,7 @@ def load_model(repo, device, label="model", force_download=False, revision=None,
     t0 = time.time()
     # Pre-download with hard timeout so a stuck CDN doesn't hang the eval lock
     # for half an hour. Skip on force_download (let from_pretrained re-pull).
-    if not force_download:
+    if not force_download and not os.path.isdir(repo):
         try:
             _prefetch_repo(repo, digest=revision,
                            timeout=int(os.environ.get("HIPPIUS_PREFETCH_TIMEOUT", "600")))
@@ -602,6 +685,16 @@ def load_model(repo, device, label="model", force_download=False, revision=None,
             raise
         except Exception as e:
             log.warning("%s prefetch failed (%s), letting from_pretrained retry", label, e)
+    if not shard_across_gpus and _maybe_raw_local_parcae_config(repo) is not None:
+        try:
+            model = _load_raw_local_parcae_model(repo, device)
+            model.eval()
+            elapsed = time.time() - t0
+            params = sum(p.numel() for p in model.parameters()) / 1e9
+            log.info("%s loaded via raw local Parcae fallback: %.1fB params in %.1fs", label, params, elapsed)
+            return model
+        except Exception as e:
+            log.warning("raw local Parcae fallback failed (%s), trying AutoModel", e)
     if shard_across_gpus:
         device_map_arg: dict | str = "auto"
         max_memory = _build_sharded_device_map(shard_across_gpus)
@@ -1662,15 +1755,14 @@ def main():
     elif args.shard:
         shard_key = args.shard
     else:
-        manifest = r2.ds_get("dataset/v2/manifest.json")
-        if not manifest:
-            manifest = r2.get("dataset/v1/manifest.json")
+        manifest, manifest_key = fetch_pretokenized_manifest(r2)
         if not manifest:
             log.error("could not fetch dataset manifest")
             sys.exit(1)
         shard_key = manifest["shards"][0]["key"]
-        log.info("using shard: %s (%d shards available, version=%s)",
-                 shard_key, len(manifest["shards"]), manifest.get("version", "v1"))
+        log.info("using shard: %s (%d shards available, version=%s, manifest=%s)",
+                 shard_key, len(manifest["shards"]), manifest.get("version", "v1"),
+                 manifest_key)
 
     same_model = args.king == args.challenger
 
